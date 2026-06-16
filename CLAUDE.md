@@ -201,10 +201,19 @@ diffing at the first mismatching field to localize float drift.
   every-~0.4 s redecision used by levels 1 & 4). Byte-exact vs the oracle for all
   levels 0–8 at 16-bit (stereo + mono), incl. the loose redecision boundary. The
   shim gained `libflac_rs_cref_encode_cfg` (a `compression_level` knob).
-- **G2 (next) — bit depths.** 8/12/20/24/32-bit: RICE2 (5-bit params, escape 31)
+- **G2 — DONE (metadata + MD5, full streams).** `md5.rs` (RFC 1321 + the
+  `format_input_` little-endian sample serialization), `metadata.rs` (STREAMINFO),
+  and `encoder::encode` (the `fLaC` marker + STREAMINFO + frames). `audio_md5`
+  byte-exact vs `FLAC__MD5`; the STREAMINFO body (min/max framesize, total samples,
+  MD5) byte-exact vs libFLAC's finalized block; and the full stream round-trips
+  through the real libFLAC **decoder** back to the original PCM. The shim gained a
+  seekable in-memory full-stream encoder (`libflac_rs_cref_encode_full`) and a
+  decode round-trip (`libflac_rs_cref_decode`). Not yet written: VORBIS_COMMENT
+  (libFLAC auto-adds a vendor block — we emit a minimal `is_last` STREAMINFO),
+  SEEKTABLE, PADDING.
+- **G3 (next) — bit depths.** 8/12/20/24/32-bit: RICE2 (5-bit params, escape 31)
   above 16 bps, the wide/33-bit side residual paths, `window_data_wide`, and the
-  `>16`→RICE2 `rice_parameter_limit`. Then metadata blocks + MD5 (full-stream
-  output), then the decoder, then Ogg.
+  `>16`→RICE2 `rice_parameter_limit`. Then the decoder, then Ogg.
 
 ## Conventions
 

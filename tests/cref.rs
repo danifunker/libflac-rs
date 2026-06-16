@@ -38,8 +38,33 @@ unsafe extern "C" {
         out: *mut u8,
         out_len: *mut usize,
     ) -> c_int;
+    fn libflac_rs_cref_encode_full(
+        interleaved: *const i32,
+        nsamples: u32,
+        channels: u32,
+        bps: u32,
+        sample_rate: u32,
+        blocksize: u32,
+        compression_level: i32,
+        do_md5: i32,
+        out: *mut u8,
+        out_len: *mut usize,
+    ) -> c_int;
+    fn libflac_rs_cref_decode(
+        data: *const u8,
+        len: usize,
+        out: *mut i32,
+        out_len: *mut usize,
+    ) -> c_int;
     fn libflac_rs_cref_crc8(data: *const u8, len: u32) -> u8;
     fn libflac_rs_cref_crc16(data: *const u8, len: u32) -> u16;
+    fn libflac_rs_cref_md5(
+        interleaved: *const i32,
+        nsamples: u32,
+        channels: u32,
+        bytes_per_sample: u32,
+        out16: *mut u8,
+    );
 
     // F2 leaf-function wrappers (see cref/shim.c).
     fn libflac_rs_cref_window_tukey(p: f32, l: i32, out: *mut f32);
@@ -164,6 +189,37 @@ fn c_encode_level(
     out
 }
 
+/// Encode a complete FLAC stream (marker + metadata + frames) via the C reference.
+fn c_encode_full(
+    interleaved: &[i32],
+    channels: u32,
+    bps: u32,
+    blocksize: u32,
+    level: i32,
+    do_md5: bool,
+) -> Vec<u8> {
+    let nsamples = (interleaved.len() / channels as usize) as u32;
+    let mut out = vec![0u8; interleaved.len() * 4 + 8192];
+    let mut out_len = out.len();
+    let rc = unsafe {
+        libflac_rs_cref_encode_full(
+            interleaved.as_ptr(),
+            nsamples,
+            channels,
+            bps,
+            44_100,
+            blocksize,
+            level,
+            do_md5 as i32,
+            out.as_mut_ptr(),
+            &mut out_len,
+        )
+    };
+    assert_eq!(rc, 0, "C encode_full returned {rc}");
+    out.truncate(out_len);
+    out
+}
+
 /// Stereo-interleave two channels of i16 (as i32, sign-extended) PCM.
 fn interleave(left: &[i16], right: &[i16]) -> Vec<i32> {
     assert_eq!(left.len(), right.len());
@@ -272,6 +328,104 @@ fn crc16_matches_c_reference() {
         let rust = libflac_rs::testing::crc16(&data);
         let c = unsafe { libflac_rs_cref_crc16(data.as_ptr(), data.len() as u32) };
         assert_eq!(rust, c, "crc16 mismatch on {}-byte input", data.len());
+    }
+}
+
+// --- Metadata: MD5 of the decoded audio (STREAMINFO checksum) ------------------
+
+/// `audio_md5` must equal libFLAC's `FLAC__MD5Accumulate`/`Final` over the same
+/// interleaved PCM, for mono/stereo and 16-bit (2 bytes/sample), across lengths
+/// that straddle the 64-byte MD5 block boundary.
+#[test]
+fn audio_md5_matches_c() {
+    for channels in [1u32, 2] {
+        for &n in &[1usize, 7, 31, 32, 33, 64, 65, 100, 2048, 4096, 5000] {
+            let stereo = gen_pcm(0xABCD ^ n as u32, n);
+            let pcm: Vec<i32> = if channels == 2 {
+                stereo[..n * 2].to_vec()
+            } else {
+                stereo.iter().step_by(2).take(n).copied().collect()
+            };
+            let rust = libflac_rs::testing::audio_md5(&pcm, 2);
+            let mut c = [0u8; 16];
+            unsafe {
+                libflac_rs_cref_md5(pcm.as_ptr(), n as u32, channels, 2, c.as_mut_ptr());
+            }
+            assert_eq!(rust, c, "md5 channels={channels} n={n}");
+        }
+    }
+}
+
+/// The STREAMINFO block (`fLaC` marker + the 34-byte body) must be byte-identical
+/// to libFLAC's, with the final min/max framesize, total samples, and (with
+/// `do_md5`) the audio checksum. libFLAC follows STREAMINFO with an auto
+/// VORBIS_COMMENT, so only the body (bytes 8..42, before that block) is compared.
+#[test]
+fn streaminfo_matches_c() {
+    let bs = 2048u32;
+    for &do_md5 in &[true, false] {
+        for level in [0u32, 5, 8] {
+            for seed in 1..=5u32 {
+                let samples = bs as usize + (seed as usize * 257) % 3000;
+                let pcm = gen_pcm(seed, samples);
+                let rust = libflac_rs::testing::encode(
+                    &pcm,
+                    2,
+                    16,
+                    44_100,
+                    bs,
+                    &libflac_rs::testing::preset(level),
+                    do_md5,
+                );
+                let c = c_encode_full(&pcm, 2, 16, bs, level as i32, do_md5);
+                assert_eq!(&rust[0..4], b"fLaC", "rust marker");
+                assert_eq!(&c[0..4], b"fLaC", "c marker");
+                assert_eq!(
+                    &rust[8..42],
+                    &c[8..42],
+                    "[level {level} seed {seed} md5 {do_md5}] STREAMINFO body differs"
+                );
+            }
+        }
+    }
+}
+
+/// The full Rust stream (marker + STREAMINFO + frames) must decode back to the
+/// exact original PCM through the real libFLAC decoder — proof the complete file
+/// is well-formed (including the `is_last` STREAMINFO with no VORBIS_COMMENT).
+#[test]
+fn full_stream_round_trips() {
+    let bs = 2048u32;
+    for level in [0u32, 4, 8] {
+        for seed in 1..=5u32 {
+            let samples = bs as usize + (seed as usize * 333) % 2500;
+            let pcm = gen_pcm(seed, samples);
+            let stream = libflac_rs::testing::encode(
+                &pcm,
+                2,
+                16,
+                44_100,
+                bs,
+                &libflac_rs::testing::preset(level),
+                true,
+            );
+            let mut decoded = vec![0i32; pcm.len()];
+            let mut dlen = decoded.len();
+            let rc = unsafe {
+                libflac_rs_cref_decode(
+                    stream.as_ptr(),
+                    stream.len(),
+                    decoded.as_mut_ptr(),
+                    &mut dlen,
+                )
+            };
+            assert_eq!(rc, 0, "[level {level} seed {seed}] decode failed: {rc}");
+            decoded.truncate(dlen);
+            assert_eq!(
+                decoded, pcm,
+                "[level {level} seed {seed}] round-trip mismatch"
+            );
+        }
     }
 }
 

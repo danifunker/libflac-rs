@@ -13,7 +13,7 @@ use crate::format::{
     MAX_FIXED_ORDER, MAX_LPC_ORDER, MAX_QLP_COEFF_PRECISION, MIN_QLP_COEFF_PRECISION,
 };
 use crate::frame::{ChannelAssignment, FrameHeader, write_frame_footer, write_frame_header};
-use crate::{fixed, lpc, rice, subframe, window};
+use crate::{fixed, lpc, metadata, rice, subframe, window};
 
 // Minimum residual partition order (0 for every compression level), and the Rice
 // parameter limit for a 16-bit stream (escape parameter 15; RICE2 is only used
@@ -523,6 +523,27 @@ pub fn encode_frames(
     blocksize: u32,
     config: &Config,
 ) -> Vec<u8> {
+    encode_frames_inner(
+        interleaved,
+        channels,
+        bits_per_sample,
+        sample_rate,
+        blocksize,
+        config,
+    )
+    .0
+}
+
+/// As [`encode_frames`], also returning the min/max frame size in bytes (for
+/// STREAMINFO). `min_framesize` is 0 if no frames were produced.
+fn encode_frames_inner(
+    interleaved: &[i32],
+    channels: u32,
+    bits_per_sample: u32,
+    sample_rate: u32,
+    blocksize: u32,
+    config: &Config,
+) -> (Vec<u8>, u32, u32) {
     let ch = channels as usize;
     assert!(ch > 0 && interleaved.len() % ch == 0, "ragged interleave");
     let total = interleaved.len() / ch;
@@ -547,6 +568,8 @@ pub fn encode_frames(
     let mut last_assignment = ChannelAssignment::Independent;
 
     let mut out = Vec::new();
+    let mut min_framesize = u32::MAX;
+    let mut max_framesize = 0u32;
     let mut frame_number = 0u32;
     let mut start = 0usize;
     while start < total {
@@ -712,10 +735,69 @@ pub fn encode_frames(
         }
 
         write_frame_footer(&mut frame);
+        let fsize = frame.as_bytes().len() as u32;
+        min_framesize = min_framesize.min(fsize);
+        max_framesize = max_framesize.max(fsize);
         out.extend_from_slice(frame.as_bytes());
 
         start += bs;
         frame_number += 1;
     }
+    if min_framesize == u32::MAX {
+        min_framesize = 0;
+    }
+    (out, min_framesize, max_framesize)
+}
+
+/// Encode interleaved integer PCM into a complete FLAC stream: the `fLaC` marker,
+/// a STREAMINFO metadata block, then the audio frames. `do_md5` controls whether
+/// STREAMINFO carries the audio MD5 (libFLAC's `--no-md5-sum` writes zeros). No
+/// VORBIS_COMMENT/padding is written (a minimal valid stream), so STREAMINFO is
+/// the last metadata block.
+pub fn encode(
+    interleaved: &[i32],
+    channels: u32,
+    bits_per_sample: u32,
+    sample_rate: u32,
+    blocksize: u32,
+    config: &Config,
+    do_md5: bool,
+) -> Vec<u8> {
+    let ch = channels as usize;
+    assert!(ch > 0 && interleaved.len() % ch == 0, "ragged interleave");
+    let total_samples = (interleaved.len() / ch) as u64;
+
+    let (frames, min_framesize, max_framesize) = encode_frames_inner(
+        interleaved,
+        channels,
+        bits_per_sample,
+        sample_rate,
+        blocksize,
+        config,
+    );
+
+    let md5 = if do_md5 {
+        crate::md5::audio_md5(interleaved, bits_per_sample.div_ceil(8) as usize)
+    } else {
+        [0u8; 16]
+    };
+
+    let si = metadata::StreamInfo {
+        min_blocksize: blocksize,
+        max_blocksize: blocksize,
+        min_framesize,
+        max_framesize,
+        sample_rate,
+        channels,
+        bits_per_sample,
+        total_samples,
+        md5,
+    };
+
+    let mut bw = BitWriter::new();
+    bw.write_byte_block(b"fLaC");
+    metadata::write_streaminfo(&mut bw, &si, /*is_last=*/ true);
+    let mut out = bw.as_bytes().to_vec();
+    out.extend_from_slice(&frames);
     out
 }

@@ -33,6 +33,8 @@ mod fixed;
 mod format;
 mod frame;
 mod lpc;
+mod md5;
+mod metadata;
 mod rice;
 mod subframe;
 mod window;
@@ -45,7 +47,8 @@ mod window;
 pub mod testing {
     pub use crate::bitwriter::BitWriter;
     pub use crate::crc::{crc8, crc16};
-    pub use crate::encoder::{Apodization, Config, encode_frames, preset};
+    pub use crate::encoder::{Apodization, Config, encode, encode_frames, preset};
+    pub use crate::md5::audio_md5;
 
     /// Apodization windows, re-exported for per-element differential testing.
     pub mod window {

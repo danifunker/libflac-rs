@@ -12,9 +12,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "FLAC/stream_decoder.h"
 #include "FLAC/stream_encoder.h"
 #include "private/crc.h"
 #include "private/lpc.h"
+#include "private/md5.h"
 #include "private/window.h"
 
 /* CRC-8 / CRC-16 reference wrappers (FLAC__crc8/16, crc.c) for the F0
@@ -137,6 +139,236 @@ int libflac_rs_cref_encode(const int32_t *interleaved, uint32_t nsamples,
     return libflac_rs_cref_encode_cfg(interleaved, nsamples, channels, bps,
                                       sample_rate, blocksize, 8, max_lpc_order,
                                       do_mid_side, out, out_len);
+}
+
+/* A seekable in-memory sink so the encoder rewrites STREAMINFO with the final
+ * min/max framesize, total samples, and MD5 at finish. Captures the complete FLAC
+ * stream (marker + metadata + frames) for verifying full-file output. */
+typedef struct {
+    uint8_t *buf;
+    size_t cap;
+    size_t pos;
+    size_t len;
+    int overflow;
+} mem_sink;
+
+static FLAC__StreamEncoderWriteStatus mem_write(const FLAC__StreamEncoder *encoder,
+                                                const FLAC__byte buffer[],
+                                                size_t bytes, uint32_t samples,
+                                                uint32_t current_frame,
+                                                void *client_data) {
+    mem_sink *s = (mem_sink *)client_data;
+    (void)encoder;
+    (void)samples;
+    (void)current_frame;
+    if (s->pos + bytes > s->cap) {
+        s->overflow = 1;
+        return FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR;
+    }
+    memcpy(s->buf + s->pos, buffer, bytes);
+    s->pos += bytes;
+    if (s->pos > s->len) {
+        s->len = s->pos;
+    }
+    return FLAC__STREAM_ENCODER_WRITE_STATUS_OK;
+}
+
+static FLAC__StreamEncoderSeekStatus mem_seek(const FLAC__StreamEncoder *encoder,
+                                              FLAC__uint64 absolute_byte_offset,
+                                              void *client_data) {
+    mem_sink *s = (mem_sink *)client_data;
+    (void)encoder;
+    s->pos = (size_t)absolute_byte_offset;
+    return FLAC__STREAM_ENCODER_SEEK_STATUS_OK;
+}
+
+static FLAC__StreamEncoderTellStatus mem_tell(const FLAC__StreamEncoder *encoder,
+                                              FLAC__uint64 *absolute_byte_offset,
+                                              void *client_data) {
+    mem_sink *s = (mem_sink *)client_data;
+    (void)encoder;
+    *absolute_byte_offset = (FLAC__uint64)s->pos;
+    return FLAC__STREAM_ENCODER_TELL_STATUS_OK;
+}
+
+/* Encode a complete FLAC stream (marker + metadata + frames) to memory at the
+ * given compression level, optionally computing the audio MD5. */
+int libflac_rs_cref_encode_full(const int32_t *interleaved, uint32_t nsamples,
+                                uint32_t channels, uint32_t bps,
+                                uint32_t sample_rate, uint32_t blocksize,
+                                int32_t compression_level, int32_t do_md5,
+                                uint8_t *out, size_t *out_len) {
+    mem_sink sink;
+    FLAC__StreamEncoder *enc;
+    FLAC__StreamEncoderInitStatus init;
+    int rc = 0;
+
+    sink.buf = out;
+    sink.cap = *out_len;
+    sink.pos = 0;
+    sink.len = 0;
+    sink.overflow = 0;
+
+    enc = FLAC__stream_encoder_new();
+    if (!enc) {
+        return -1;
+    }
+
+    FLAC__stream_encoder_set_verify(enc, false);
+    FLAC__stream_encoder_set_compression_level(
+        enc, compression_level >= 0 ? (uint32_t)compression_level : 8);
+    FLAC__stream_encoder_set_channels(enc, channels);
+    FLAC__stream_encoder_set_bits_per_sample(enc, bps);
+    FLAC__stream_encoder_set_sample_rate(enc, sample_rate);
+    FLAC__stream_encoder_set_total_samples_estimate(enc, 0);
+    FLAC__stream_encoder_set_streamable_subset(enc, false);
+    FLAC__stream_encoder_set_blocksize(enc, blocksize);
+    FLAC__stream_encoder_set_do_md5(enc, do_md5 != 0);
+
+    init = FLAC__stream_encoder_init_stream(enc, mem_write, mem_seek, mem_tell,
+                                            NULL, &sink);
+    if (init != FLAC__STREAM_ENCODER_INIT_STATUS_OK) {
+        FLAC__stream_encoder_delete(enc);
+        return -100 - (int)init;
+    }
+
+    if (!FLAC__stream_encoder_process_interleaved(enc, interleaved, nsamples)) {
+        rc = -200 - (int)FLAC__stream_encoder_get_state(enc);
+    } else if (!FLAC__stream_encoder_finish(enc)) {
+        rc = -300 - (int)FLAC__stream_encoder_get_state(enc);
+    }
+
+    FLAC__stream_encoder_delete(enc);
+
+    if (rc != 0) {
+        return rc;
+    }
+    if (sink.overflow) {
+        return -2;
+    }
+    *out_len = sink.len;
+    return 0;
+}
+
+/* ---- Decoder round-trip --------------------------------------------------
+ * Decode a complete in-memory FLAC stream back to interleaved PCM via the real
+ * libFLAC decoder, to prove the Rust full-stream output is a valid, decodable
+ * file (marker + STREAMINFO + frames). */
+typedef struct {
+    const uint8_t *data;
+    size_t len;
+    size_t pos;
+    int32_t *out;
+    size_t out_cap;
+    size_t out_len;
+    int error;
+} dec_ctx;
+
+static FLAC__StreamDecoderReadStatus dec_read(const FLAC__StreamDecoder *decoder,
+                                              FLAC__byte buffer[], size_t *bytes,
+                                              void *client_data) {
+    dec_ctx *c = (dec_ctx *)client_data;
+    size_t avail = c->len - c->pos;
+    size_t want = *bytes;
+    (void)decoder;
+    if (want > avail) {
+        want = avail;
+    }
+    if (want == 0) {
+        *bytes = 0;
+        return FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM;
+    }
+    memcpy(buffer, c->data + c->pos, want);
+    c->pos += want;
+    *bytes = want;
+    return FLAC__STREAM_DECODER_READ_STATUS_CONTINUE;
+}
+
+static FLAC__StreamDecoderWriteStatus dec_write(const FLAC__StreamDecoder *decoder,
+                                                const FLAC__Frame *frame,
+                                                const FLAC__int32 *const buffer[],
+                                                void *client_data) {
+    dec_ctx *c = (dec_ctx *)client_data;
+    uint32_t blocksize = frame->header.blocksize;
+    uint32_t channels = frame->header.channels;
+    uint32_t i, j;
+    (void)decoder;
+    for (i = 0; i < blocksize; i++)
+        for (j = 0; j < channels; j++)
+            if (c->out_len < c->out_cap)
+                c->out[c->out_len++] = buffer[j][i];
+    return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
+}
+
+static void dec_error(const FLAC__StreamDecoder *decoder,
+                      FLAC__StreamDecoderErrorStatus status, void *client_data) {
+    dec_ctx *c = (dec_ctx *)client_data;
+    (void)decoder;
+    c->error = (int)status + 1;
+}
+
+int libflac_rs_cref_decode(const uint8_t *data, size_t len, int32_t *out,
+                           size_t *out_len) {
+    dec_ctx c;
+    FLAC__StreamDecoder *dec;
+
+    c.data = data;
+    c.len = len;
+    c.pos = 0;
+    c.out = out;
+    c.out_cap = *out_len;
+    c.out_len = 0;
+    c.error = 0;
+
+    dec = FLAC__stream_decoder_new();
+    if (!dec) {
+        return -1;
+    }
+    if (FLAC__stream_decoder_init_stream(dec, dec_read, NULL, NULL, NULL, NULL,
+                                         dec_write, NULL, dec_error,
+                                         &c) != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
+        FLAC__stream_decoder_delete(dec);
+        return -2;
+    }
+    if (!FLAC__stream_decoder_process_until_end_of_stream(dec)) {
+        FLAC__stream_decoder_delete(dec);
+        return -3;
+    }
+    FLAC__stream_decoder_finish(dec);
+    FLAC__stream_decoder_delete(dec);
+
+    if (c.error) {
+        return -100 - c.error;
+    }
+    *out_len = c.out_len;
+    return 0;
+}
+
+/* MD5 of the decoded audio (`FLAC__MD5Accumulate`/`Final`), de-interleaving the
+ * input into per-channel arrays as the encoder holds it. Verifies the STREAMINFO
+ * audio checksum. */
+void libflac_rs_cref_md5(const int32_t *interleaved, uint32_t nsamples,
+                         uint32_t channels, uint32_t bytes_per_sample,
+                         uint8_t *out16) {
+    FLAC__MD5Context ctx;
+    int32_t *chans[8];
+    const FLAC__int32 *signal[8];
+    uint32_t c, i;
+
+    for (c = 0; c < channels; c++) {
+        chans[c] = (int32_t *)malloc((size_t)nsamples * sizeof(int32_t));
+        signal[c] = chans[c];
+    }
+    for (i = 0; i < nsamples; i++)
+        for (c = 0; c < channels; c++)
+            chans[c][i] = interleaved[i * channels + c];
+
+    FLAC__MD5Init(&ctx);
+    FLAC__MD5Accumulate(&ctx, signal, channels, nsamples, bytes_per_sample);
+    FLAC__MD5Final(out16, &ctx);
+
+    for (c = 0; c < channels; c++)
+        free(chans[c]);
 }
 
 /* ---- F2 leaf-function wrappers --------------------------------------------
