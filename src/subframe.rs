@@ -61,14 +61,7 @@ pub fn write_fixed(
     for &w in warmup {
         bw.write_raw_i64(w as i64, subframe_bps);
     }
-    // Entropy coding method: always plain RICE for a 16-bit stream (parameters
-    // never reach the escape value, so RICE2 is never selected).
-    bw.write_raw_u32(
-        ENTROPY_CODING_METHOD_PARTITIONED_RICE,
-        ENTROPY_CODING_METHOD_TYPE_LEN,
-    );
-    bw.write_raw_u32(rice.order, ENTROPY_CODING_METHOD_PARTITIONED_RICE_ORDER_LEN);
-    write_residual_partitioned_rice(bw, residual, order, &rice.parameters, rice.order);
+    write_entropy_and_residual(bw, residual, order, rice);
 }
 
 /// Bit cost of a FIXED subframe (`evaluate_fixed_subframe_`,
@@ -112,12 +105,33 @@ pub fn write_lpc(
     for &c in qlp_coeff {
         bw.write_raw_i32(c, precision);
     }
-    bw.write_raw_u32(
-        ENTROPY_CODING_METHOD_PARTITIONED_RICE,
-        ENTROPY_CODING_METHOD_TYPE_LEN,
-    );
+    write_entropy_and_residual(bw, residual, order, rice);
+}
+
+/// Write the entropy-coding-method header (RICE or RICE2 by `rice.is_rice2`) and
+/// the partitioned-rice residual (`add_entropy_coding_method_` +
+/// `add_residual_partitioned_rice_`).
+fn write_entropy_and_residual(
+    bw: &mut BitWriter,
+    residual: &[i32],
+    predictor_order: u32,
+    rice: &RicePartition,
+) {
+    let method_type = if rice.is_rice2 {
+        ENTROPY_CODING_METHOD_PARTITIONED_RICE2
+    } else {
+        ENTROPY_CODING_METHOD_PARTITIONED_RICE
+    };
+    bw.write_raw_u32(method_type, ENTROPY_CODING_METHOD_TYPE_LEN);
     bw.write_raw_u32(rice.order, ENTROPY_CODING_METHOD_PARTITIONED_RICE_ORDER_LEN);
-    write_residual_partitioned_rice(bw, residual, order, &rice.parameters, rice.order);
+    write_residual_partitioned_rice(
+        bw,
+        residual,
+        predictor_order,
+        &rice.parameters,
+        rice.order,
+        rice.is_rice2,
+    );
 }
 
 /// Bit cost of an LPC subframe (`evaluate_lpc_subframe_`, `stream_encoder.c:4043`):
@@ -151,8 +165,13 @@ fn write_residual_partitioned_rice(
     predictor_order: u32,
     parameters: &[u32],
     partition_order: u32,
+    is_rice2: bool,
 ) {
-    let plen = ENTROPY_CODING_METHOD_PARTITIONED_RICE_PARAMETER_LEN;
+    let plen = if is_rice2 {
+        ENTROPY_CODING_METHOD_PARTITIONED_RICE2_PARAMETER_LEN
+    } else {
+        ENTROPY_CODING_METHOD_PARTITIONED_RICE_PARAMETER_LEN
+    };
     if partition_order == 0 {
         bw.write_raw_u32(parameters[0], plen);
         bw.write_rice_signed_block(residual, parameters[0]);

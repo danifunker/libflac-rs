@@ -213,9 +213,13 @@ diffing at the first mismatching field to localize float drift.
   and no padding the **entire** stream is byte-identical to libFLAC's default
   output (`libflac_rs_cref_vendor_string` confirms the version string). Not yet
   written: SEEKTABLE / other metadata block types.
-- **G3 (next) — bit depths.** 8/12/20/24/32-bit: RICE2 (5-bit params, escape 31)
-  above 16 bps, the wide/33-bit side residual paths, `window_data_wide`, and the
-  `>16`→RICE2 `rice_parameter_limit`. Then the decoder, then Ogg.
+- **G3 — bit depths (8/12/16/20/24 DONE; 32-bit pending).** RICE2 (5-bit params,
+  escape 31) is selected per partition when any rice parameter reaches 15
+  (`RicePartition::is_rice2`), driven by the `bps>16 ? 31 : 15` rice-parameter
+  limit; frames and full streams byte-exact for 8/12/16/20/24-bit. **32-bit** still
+  needs the 33-bit side channel + wide residual (`integer_signal_33bit_side`,
+  `_wide`/`_limit_residual`, `window_data_wide`): `side = L-R`/`mid = (L+R)>>1`
+  overflow `i32`. Then the decoder, then Ogg.
 
 ## Conventions
 

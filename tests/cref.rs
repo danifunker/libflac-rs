@@ -1111,6 +1111,106 @@ fn mono_levels_match_c() {
     }
 }
 
+/// Rust frame bytes at an explicit compression level and bit depth.
+fn rust_frames_level_bps(
+    interleaved: &[i32],
+    channels: u32,
+    blocksize: u32,
+    level: u32,
+    bps: u32,
+) -> Vec<u8> {
+    let cfg = libflac_rs::testing::preset(level);
+    libflac_rs::testing::encode_frames(interleaved, channels, bps, 44_100, blocksize, &cfg)
+}
+
+/// Diverse multi-partial + noise PCM scaled to fill a `bps`-bit range, for the
+/// wider-bit-depth tests (RICE for 8/12, RICE2 for 20/24/32; 33-bit side at 32).
+fn gen_pcm_bps(seed: u32, samples_per_channel: usize, bps: u32) -> Vec<i32> {
+    let mut st = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let urand = |st: &mut u32| (lcg(st) >> 8) as f64 / 16_777_216.0;
+    let maxv = ((1i64 << (bps - 1)) - 1) as f64;
+    let minv = -(1i64 << (bps - 1)) as f64;
+    let scale = (1u64 << (bps - 1)) as f64 / 32768.0;
+    let np = 1 + (urand(&mut st) * 4.0) as usize;
+    let partials: Vec<(f64, f64, f64)> = (0..np)
+        .map(|_| {
+            (
+                urand(&mut st) * 3.1,
+                (200.0 + urand(&mut st) * 7000.0) * scale,
+                urand(&mut st) * std::f64::consts::TAU,
+            )
+        })
+        .collect();
+    let noise = urand(&mut st) * urand(&mut st) * 2000.0 * scale;
+    let mut out = Vec::with_capacity(samples_per_channel * 2);
+    for i in 0..samples_per_channel {
+        for ch in 0..2u32 {
+            let mut v = 0.0f64;
+            for &(f, a, p) in &partials {
+                v += a * (f * i as f64 + p + ch as f64 * 0.4).sin();
+            }
+            v += noise * ((lcg(&mut st) >> 16) as u16 as i16 as f64 / 32768.0);
+            out.push(v.round().clamp(minv, maxv) as i32);
+        }
+    }
+    out
+}
+
+/// G3: wider bit depths. 8/12-bit use RICE; 20/24-bit use RICE2. (32-bit, which
+/// needs the 33-bit side channel, is covered separately.) Byte-exact across levels.
+#[test]
+fn bit_depths_match_c() {
+    let bs = 2048u32;
+    for &bps in &[8u32, 12, 20, 24] {
+        for level in [0u32, 5, 8] {
+            for seed in 1..=4u32 {
+                let samples = bs as usize + (seed as usize * 191) % 2000;
+                let pcm = gen_pcm_bps(seed, samples, bps);
+                let rust = rust_frames_level_bps(&pcm, 2, bs, level, bps);
+                let c = c_encode_level(&pcm, 2, bps, bs, level as i32);
+                assert_eq!(
+                    rust, c,
+                    "[bps {bps} level {level} seed {seed}] frames differ"
+                );
+            }
+        }
+    }
+}
+
+/// Wider bit depths through the **full** pipeline: complete stream (STREAMINFO
+/// with the wider bps + 3-byte/etc. MD5, VORBIS_COMMENT, frames) byte-identical to
+/// libFLAC's default output for 8/12/20/24-bit.
+#[test]
+fn wider_depth_full_stream_matches_c() {
+    let bs = 2048u32;
+    let mut buf = [0u8; 128];
+    let len = unsafe { libflac_rs_cref_vendor_string(buf.as_mut_ptr(), buf.len()) };
+    let vendor = std::str::from_utf8(&buf[..len]).unwrap();
+    for &bps in &[8u32, 12, 20, 24] {
+        for level in [0u32, 5, 8] {
+            for seed in 1..=3u32 {
+                let pcm = gen_pcm_bps(seed, bs as usize + 700, bps);
+                let rust = libflac_rs::testing::encode(
+                    &pcm,
+                    2,
+                    bps,
+                    44_100,
+                    bs,
+                    &libflac_rs::testing::preset(level),
+                    true,
+                    Some(vendor),
+                    0,
+                );
+                let c = c_encode_full(&pcm, 2, bps, bs, level as i32, true);
+                assert_eq!(
+                    rust, c,
+                    "[bps {bps} level {level} seed {seed}] full stream differs"
+                );
+            }
+        }
+    }
+}
+
 fn lcg(state: &mut u32) -> u32 {
     *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
     *state

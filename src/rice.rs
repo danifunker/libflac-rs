@@ -16,6 +16,10 @@ pub const MAX_RICE_PARTITION_ORDER: u32 = 15;
 pub struct RicePartition {
     pub order: u32,
     pub parameters: Vec<u32>,
+    /// True if any parameter reaches the RICE escape value (15), so the subframe
+    /// must use PARTITIONED_RICE2 (5-bit parameters) — only possible above 16 bps
+    /// (`find_best_partition_order_`, `stream_encoder.c:4172`).
+    pub is_rice2: bool,
 }
 
 #[inline]
@@ -208,10 +212,16 @@ pub fn find_best_partition_order(
         po -= 1;
     }
 
+    // PARTITIONED_RICE2 is used iff any parameter reached the RICE escape value.
+    let is_rice2 = best_params
+        .iter()
+        .any(|&p| p >= ENTROPY_CODING_METHOD_PARTITIONED_RICE_ESCAPE_PARAMETER);
+
     (
         RicePartition {
             order: best_order,
             parameters: best_params,
+            is_rice2,
         },
         best_bits,
     )

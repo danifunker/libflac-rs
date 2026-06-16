@@ -4,22 +4,32 @@
 //! channel decision (L/R vs L/S vs R/S vs M/S by estimated bits, including the
 //! `loose_mid_side` periodic-redecision mode). All compression levels 0–8 are
 //! supported via [`Config`]/[`preset`] (the `tukey(0.5)` / `subdivide_tukey(2|3)`
-//! apodizations and the per-level LPC-order / partition-order caps). Currently
-//! 16-bit; wider bit depths (RICE2, wide residual) come later.
+//! apodizations and the per-level LPC-order / partition-order caps). Bit depths
+//! 8/12/16/20/24 are supported (RICE2 entropy coding above 16 bps); 32-bit (the
+//! 33-bit side channel / wide residual paths) is still to come.
 
 use crate::bitmath;
 use crate::bitwriter::BitWriter;
 use crate::format::{
-    MAX_FIXED_ORDER, MAX_LPC_ORDER, MAX_QLP_COEFF_PRECISION, MIN_QLP_COEFF_PRECISION,
+    ENTROPY_CODING_METHOD_PARTITIONED_RICE_ESCAPE_PARAMETER,
+    ENTROPY_CODING_METHOD_PARTITIONED_RICE2_ESCAPE_PARAMETER, MAX_FIXED_ORDER, MAX_LPC_ORDER,
+    MAX_QLP_COEFF_PRECISION, MIN_QLP_COEFF_PRECISION,
 };
 use crate::frame::{ChannelAssignment, FrameHeader, write_frame_footer, write_frame_header};
 use crate::{fixed, lpc, metadata, rice, subframe, window};
 
-// Minimum residual partition order (0 for every compression level), and the Rice
-// parameter limit for a 16-bit stream (escape parameter 15; RICE2 is only used
-// above 16 bps).
+/// Minimum residual partition order (0 for every compression level).
 const MIN_RESIDUAL_PARTITION_ORDER: u32 = 0;
-const RICE_PARAMETER_LIMIT_16BPS: u32 = 15;
+
+/// The Rice parameter limit (escape value): RICE2 (31) above 16 bps, else RICE
+/// (15) (`process_subframe_`, `stream_encoder.c:3471`). Based on the *stream* bps.
+fn rice_parameter_limit(bits_per_sample: u32) -> u32 {
+    if bits_per_sample > 16 {
+        ENTROPY_CODING_METHOD_PARTITIONED_RICE2_ESCAPE_PARAMETER
+    } else {
+        ENTROPY_CODING_METHOD_PARTITIONED_RICE_ESCAPE_PARAMETER
+    }
+}
 
 /// The apodization a compression level uses. Both variants ultimately window with
 /// a Tukey window; `SubdivideTukey` additionally evaluates the per-subdivision
@@ -410,6 +420,7 @@ fn choose_subframe(
     subframe_bps: u32,
     wasted_bits: u32,
     blocksize: u32,
+    rice_parameter_limit: u32,
     min_partition_order: u32,
     max_partition_order: u32,
     lpc_ctx: Option<&LpcCtx>,
@@ -431,7 +442,7 @@ fn choose_subframe(
             let (rice_part, residual_bits) = rice::find_best_partition_order(
                 &residual,
                 order,
-                RICE_PARAMETER_LIMIT_16BPS,
+                rice_parameter_limit,
                 min_partition_order,
                 max_partition_order,
             );
@@ -452,7 +463,7 @@ fn choose_subframe(
                     wasted_bits,
                     blocksize,
                     ctx,
-                    RICE_PARAMETER_LIMIT_16BPS,
+                    rice_parameter_limit,
                     min_partition_order,
                     max_partition_order,
                 ) {
@@ -609,6 +620,7 @@ fn encode_frames_inner(
                 subframe_bps,
                 wasted,
                 bs as u32,
+                rice_parameter_limit(bits_per_sample),
                 min_partition_order,
                 max_partition_order,
                 lpc_ctx.as_ref(),
