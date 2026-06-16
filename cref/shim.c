@@ -371,6 +371,17 @@ void libflac_rs_cref_md5(const int32_t *interleaved, uint32_t nsamples,
         free(chans[c]);
 }
 
+/* The compiled libFLAC's vendor string (written into the default VORBIS_COMMENT),
+ * so the full-stream test can match it without hardcoding the version. Returns the
+ * length; copies into `out` when `cap` is large enough. */
+size_t libflac_rs_cref_vendor_string(char *out, size_t cap) {
+    size_t len = strlen(FLAC__VENDOR_STRING);
+    if (out && cap >= len) {
+        memcpy(out, FLAC__VENDOR_STRING, len);
+    }
+    return len;
+}
+
 /* ---- F2 leaf-function wrappers --------------------------------------------
  * Expose the individual float-pipeline stages so the Rust port can be diffed
  * against the C reference one stage at a time (window -> windowing ->

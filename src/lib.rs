@@ -49,6 +49,7 @@ pub mod testing {
     pub use crate::crc::{crc8, crc16};
     pub use crate::encoder::{Apodization, Config, encode, encode_frames, preset};
     pub use crate::md5::audio_md5;
+    pub use crate::metadata::LIBFLAC_VENDOR_STRING;
 
     /// Apodization windows, re-exported for per-element differential testing.
     pub mod window {

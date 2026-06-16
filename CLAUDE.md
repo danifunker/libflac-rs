@@ -208,9 +208,11 @@ diffing at the first mismatching field to localize float drift.
   MD5) byte-exact vs libFLAC's finalized block; and the full stream round-trips
   through the real libFLAC **decoder** back to the original PCM. The shim gained a
   seekable in-memory full-stream encoder (`libflac_rs_cref_encode_full`) and a
-  decode round-trip (`libflac_rs_cref_decode`). Not yet written: VORBIS_COMMENT
-  (libFLAC auto-adds a vendor block — we emit a minimal `is_last` STREAMINFO),
-  SEEKTABLE, PADDING.
+  decode round-trip (`libflac_rs_cref_decode`). `encode` also writes the optional
+  VORBIS_COMMENT (vendor) + PADDING blocks: with `metadata::LIBFLAC_VENDOR_STRING`
+  and no padding the **entire** stream is byte-identical to libFLAC's default
+  output (`libflac_rs_cref_vendor_string` confirms the version string). Not yet
+  written: SEEKTABLE / other metadata block types.
 - **G3 (next) — bit depths.** 8/12/20/24/32-bit: RICE2 (5-bit params, escape 31)
   above 16 bps, the wide/33-bit side residual paths, `window_data_wide`, and the
   `>16`→RICE2 `rice_parameter_limit`. Then the decoder, then Ogg.

@@ -21,18 +21,29 @@ pub struct StreamInfo {
     pub md5: [u8; 16],
 }
 
-/// STREAMINFO block type code.
+/// Metadata block type codes.
 const METADATA_TYPE_STREAMINFO: u32 = 0;
+const METADATA_TYPE_PADDING: u32 = 1;
+const METADATA_TYPE_VORBIS_COMMENT: u32 = 4;
 /// STREAMINFO body length in bytes.
 const STREAMINFO_LENGTH: u32 = 34;
+
+/// The vendor string libFLAC 1.4.3 writes into its auto VORBIS_COMMENT
+/// (`FLAC__VENDOR_STRING` = `"reference libFLAC " PACKAGE_VERSION " 20230623"`
+/// with no git tag/hash defined). Used to byte-match libFLAC's default output.
+pub const LIBFLAC_VENDOR_STRING: &str = "reference libFLAC 1.4.3 20230623";
+
+/// Write a metadata block header (1-bit last flag, 7-bit type, 24-bit length).
+fn write_block_header(bw: &mut BitWriter, is_last: bool, block_type: u32, length: u32) {
+    bw.write_raw_u32(is_last as u32, 1);
+    bw.write_raw_u32(block_type, 7);
+    bw.write_raw_u32(length, 24);
+}
 
 /// Write the STREAMINFO metadata block (4-byte block header + 34-byte body).
 /// `is_last` sets the last-metadata-block flag.
 pub fn write_streaminfo(bw: &mut BitWriter, si: &StreamInfo, is_last: bool) {
-    // Metadata block header: 1-bit last flag, 7-bit type, 24-bit length.
-    bw.write_raw_u32(is_last as u32, 1);
-    bw.write_raw_u32(METADATA_TYPE_STREAMINFO, 7);
-    bw.write_raw_u32(STREAMINFO_LENGTH, 24);
+    write_block_header(bw, is_last, METADATA_TYPE_STREAMINFO, STREAMINFO_LENGTH);
 
     bw.write_raw_u32(si.min_blocksize, 16);
     bw.write_raw_u32(si.max_blocksize, 16);
@@ -43,4 +54,24 @@ pub fn write_streaminfo(bw: &mut BitWriter, si: &StreamInfo, is_last: bool) {
     bw.write_raw_u32(si.bits_per_sample - 1, 5);
     bw.write_raw_u64(si.total_samples, 36);
     bw.write_byte_block(&si.md5);
+}
+
+/// Write a VORBIS_COMMENT block with the given vendor string and no comments
+/// (the empty block libFLAC auto-writes; `add_metadata_block`,
+/// `stream_encoder_framing.c:132`). The vendor length and comment count are
+/// little-endian per the Vorbis comment spec.
+pub fn write_vorbis_comment(bw: &mut BitWriter, vendor: &str, is_last: bool) {
+    let vendor = vendor.as_bytes();
+    let length = 4 + vendor.len() as u32 + 4; // vendor-length + vendor + num-comments
+    write_block_header(bw, is_last, METADATA_TYPE_VORBIS_COMMENT, length);
+    bw.write_raw_u32_little_endian(vendor.len() as u32);
+    bw.write_byte_block(vendor);
+    bw.write_raw_u32_little_endian(0); // num_comments
+}
+
+/// Write a PADDING block of `length` zero bytes (`add_metadata_block`,
+/// `stream_encoder_framing.c:112`).
+pub fn write_padding(bw: &mut BitWriter, length: u32, is_last: bool) {
+    write_block_header(bw, is_last, METADATA_TYPE_PADDING, length);
+    bw.write_zeroes(length * 8);
 }

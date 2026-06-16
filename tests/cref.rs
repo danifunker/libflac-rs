@@ -56,6 +56,7 @@ unsafe extern "C" {
         out: *mut i32,
         out_len: *mut usize,
     ) -> c_int;
+    fn libflac_rs_cref_vendor_string(out: *mut u8, cap: usize) -> usize;
     fn libflac_rs_cref_crc8(data: *const u8, len: u32) -> u8;
     fn libflac_rs_cref_crc16(data: *const u8, len: u32) -> u16;
     fn libflac_rs_cref_md5(
@@ -376,6 +377,8 @@ fn streaminfo_matches_c() {
                     bs,
                     &libflac_rs::testing::preset(level),
                     do_md5,
+                    None,
+                    0,
                 );
                 let c = c_encode_full(&pcm, 2, 16, bs, level as i32, do_md5);
                 assert_eq!(&rust[0..4], b"fLaC", "rust marker");
@@ -400,6 +403,7 @@ fn full_stream_round_trips() {
         for seed in 1..=5u32 {
             let samples = bs as usize + (seed as usize * 333) % 2500;
             let pcm = gen_pcm(seed, samples);
+            // Also exercise a VORBIS_COMMENT and a PADDING block, so those decode.
             let stream = libflac_rs::testing::encode(
                 &pcm,
                 2,
@@ -408,6 +412,8 @@ fn full_stream_round_trips() {
                 bs,
                 &libflac_rs::testing::preset(level),
                 true,
+                Some("libflac-rs round-trip"),
+                100,
             );
             let mut decoded = vec![0i32; pcm.len()];
             let mut dlen = decoded.len();
@@ -424,6 +430,49 @@ fn full_stream_round_trips() {
             assert_eq!(
                 decoded, pcm,
                 "[level {level} seed {seed}] round-trip mismatch"
+            );
+        }
+    }
+}
+
+/// The hardcoded vendor constant must match the compiled libFLAC's
+/// `FLAC__VENDOR_STRING`.
+#[test]
+fn vendor_string_matches_c() {
+    let mut buf = [0u8; 128];
+    let len = unsafe { libflac_rs_cref_vendor_string(buf.as_mut_ptr(), buf.len()) };
+    let c_vendor = std::str::from_utf8(&buf[..len]).unwrap();
+    assert_eq!(libflac_rs::testing::LIBFLAC_VENDOR_STRING, c_vendor);
+}
+
+/// With the libFLAC vendor string and no padding, the **entire** Rust stream
+/// (marker + STREAMINFO + auto VORBIS_COMMENT + frames) must be byte-identical to
+/// libFLAC's default full output — not just the STREAMINFO body.
+#[test]
+fn full_stream_matches_c_default() {
+    let bs = 2048u32;
+    let mut buf = [0u8; 128];
+    let len = unsafe { libflac_rs_cref_vendor_string(buf.as_mut_ptr(), buf.len()) };
+    let vendor = std::str::from_utf8(&buf[..len]).unwrap();
+    for level in [0u32, 4, 8] {
+        for seed in 1..=5u32 {
+            let samples = bs as usize + (seed as usize * 281) % 3000;
+            let pcm = gen_pcm(seed, samples);
+            let rust = libflac_rs::testing::encode(
+                &pcm,
+                2,
+                16,
+                44_100,
+                bs,
+                &libflac_rs::testing::preset(level),
+                true,
+                Some(vendor),
+                0,
+            );
+            let c = c_encode_full(&pcm, 2, 16, bs, level as i32, true);
+            assert_eq!(
+                rust, c,
+                "[level {level} seed {seed}] full stream differs from libFLAC"
             );
         }
     }
