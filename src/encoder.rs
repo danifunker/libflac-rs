@@ -1,7 +1,9 @@
 //! Block/frame orchestration, ported from `process_frame_` /
-//! `process_subframes_` / `process_subframe_` (`stream_encoder.c`). Independent
-//! channels with CONSTANT/VERBATIM/FIXED/LPC subframes (the level-8 settings with
-//! mid-side off). The mid-side channel decision is added in a later milestone.
+//! `process_subframes_` / `process_subframe_` (`stream_encoder.c`).
+//! CONSTANT/VERBATIM/FIXED/LPC subframes and, for stereo, the per-frame mid-side
+//! channel decision (L/R vs L/S vs R/S vs M/S by estimated bits) — the full
+//! level-8 config. This is the complete CHD/MAME slice; generalization to other
+//! bit depths/levels/windows comes later.
 
 use crate::bitmath;
 use crate::bitwriter::BitWriter;
@@ -92,6 +94,16 @@ enum Choice {
         rice: rice::RicePartition,
     },
     Lpc(LpcChoice),
+}
+
+/// A channel's chosen subframe plus everything needed to write it once the
+/// channel assignment is decided.
+struct ChosenChannel {
+    signal: Vec<i32>,
+    subframe_bps: u32,
+    wasted_bits: u32,
+    choice: Choice,
+    bits: u32,
 }
 
 /// Advance the `subdivide_tukey` a/b/c state to the next sub-window
@@ -311,14 +323,14 @@ fn best_lpc_subframe(
     best
 }
 
-/// Choose and write the smallest-estimate subframe for one (already
-/// wasted-bits-shifted) channel block; returns its estimated bit cost
+/// Choose the smallest-estimate subframe for one (already wasted-bits-shifted)
+/// channel block, returning the choice and its estimated bit cost
 /// (`process_subframe_`, `stream_encoder.c:3441`). VERBATIM is the baseline;
 /// CONSTANT wins for a single repeated value; otherwise FIXED and LPC compete. On
-/// ties the earlier candidate is kept (strict `<`).
+/// ties the earlier candidate is kept (strict `<`). Writing is deferred so the
+/// mid-side channel decision can pick among already-evaluated subframes.
 #[allow(clippy::too_many_arguments)]
-fn process_subframe(
-    bw: &mut BitWriter,
+fn choose_subframe(
     signal: &[i32],
     subframe_bps: u32,
     wasted_bits: u32,
@@ -326,7 +338,7 @@ fn process_subframe(
     min_partition_order: u32,
     max_partition_order: u32,
     lpc_ctx: Option<&LpcCtx>,
-) -> u32 {
+) -> (Choice, u32) {
     let bs = signal.len() as u32;
     let mut best_bits = subframe::verbatim_bits(bs, subframe_bps, wasted_bits);
     let mut best = Choice::Verbatim;
@@ -378,7 +390,19 @@ fn process_subframe(
         }
     }
 
-    match best {
+    (best, best_bits)
+}
+
+/// Write a previously-chosen subframe (`add_subframe_`, `stream_encoder.c:3787`).
+/// `signal` is the channel block the choice was made on (for warmup/raw samples).
+fn write_choice(
+    bw: &mut BitWriter,
+    choice: &Choice,
+    signal: &[i32],
+    subframe_bps: u32,
+    wasted_bits: u32,
+) {
+    match choice {
         Choice::Constant => {
             subframe::write_constant(bw, signal[0] as i64, subframe_bps, wasted_bits)
         }
@@ -389,12 +413,12 @@ fn process_subframe(
             rice,
         } => subframe::write_fixed(
             bw,
-            order,
-            &signal[..order as usize],
+            *order,
+            &signal[..*order as usize],
             subframe_bps,
             wasted_bits,
-            &residual,
-            &rice,
+            residual,
+            rice,
         ),
         Choice::Lpc(c) => subframe::write_lpc(
             bw,
@@ -409,13 +433,12 @@ fn process_subframe(
             &c.rice,
         ),
     }
-    best_bits
 }
 
-/// Encode interleaved integer PCM into FLAC audio frames (no metadata), each
-/// channel independent. `max_lpc_order` mirrors the C staging knob: 0 disables
-/// LPC (fixed/constant/verbatim only), otherwise it is the LPC order cap (12 at
-/// level 8). The block size is fixed except for a possibly shorter final frame.
+/// Encode interleaved integer PCM into FLAC audio frames (no metadata).
+/// `max_lpc_order` mirrors the C staging knob (0 disables LPC; 12 = level 8), and
+/// `do_mid_side` enables the per-frame stereo channel decision (L/R vs L/S vs R/S
+/// vs M/S). The block size is fixed except for a possibly shorter final frame.
 pub fn encode_frames(
     interleaved: &[i32],
     channels: u32,
@@ -423,10 +446,12 @@ pub fn encode_frames(
     sample_rate: u32,
     blocksize: u32,
     max_lpc_order: u32,
+    do_mid_side: bool,
 ) -> Vec<u8> {
     let ch = channels as usize;
     assert!(ch > 0 && interleaved.len() % ch == 0, "ragged interleave");
     let total = interleaved.len() / ch;
+    let mid_side = do_mid_side && ch == 2;
 
     // Auto qlp precision is fixed once from the stream bps and the full block size.
     let qlp_coeff_precision = auto_qlp_coeff_precision(bits_per_sample, blocksize);
@@ -462,35 +487,113 @@ pub fn encode_frames(
             parts: SUBDIVIDE_TUKEY_PARTS,
         });
 
-        let mut frame = BitWriter::new();
-        write_frame_header(
-            &mut frame,
-            &FrameHeader {
-                blocksize: bs as u32,
-                sample_rate,
-                channels,
-                channel_assignment: ChannelAssignment::Independent,
-                bits_per_sample,
-                frame_number,
-            },
-        );
-
-        for c in 0..ch {
-            let mut sig: Vec<i32> = (0..bs).map(|i| interleaved[(start + i) * ch + c]).collect();
+        // Wasted-bits-shift a channel signal, then choose its best subframe.
+        // `extra_bps` is 1 for the side channel (its values span one extra bit).
+        let choose = |signal: Vec<i32>, extra_bps: u32| -> ChosenChannel {
+            let mut sig = signal;
             let mut wasted = get_wasted_bits(&mut sig);
             if wasted > bits_per_sample {
                 wasted = bits_per_sample;
             }
-            process_subframe(
-                &mut frame,
+            let subframe_bps = bits_per_sample - wasted + extra_bps;
+            let (choice, bits) = choose_subframe(
                 &sig,
-                bits_per_sample - wasted,
+                subframe_bps,
                 wasted,
                 bs as u32,
                 min_partition_order,
                 max_partition_order,
                 lpc_ctx.as_ref(),
             );
+            ChosenChannel {
+                signal: sig,
+                subframe_bps,
+                wasted_bits: wasted,
+                choice,
+                bits,
+            }
+        };
+
+        let mut frame = BitWriter::new();
+
+        if mid_side {
+            // Mid/side are formed from the *original* (pre-wasted-shift) left and
+            // right (`process_subframes_:3210`): side = L - R, mid = (L + R) >> 1.
+            let left: Vec<i32> = (0..bs).map(|i| interleaved[(start + i) * ch]).collect();
+            let right: Vec<i32> = (0..bs).map(|i| interleaved[(start + i) * ch + 1]).collect();
+            let mid: Vec<i32> = (0..bs).map(|i| (left[i] + right[i]) >> 1).collect();
+            let side: Vec<i32> = (0..bs).map(|i| left[i] - right[i]).collect();
+
+            let cl = choose(left, 0);
+            let cr = choose(right, 0);
+            let cm = choose(mid, 0);
+            let cs = choose(side, 1);
+
+            // Smallest total frame wins; independent is preferred on ties (the C
+            // starts there and replaces only on strict improvement, ca = 1..3).
+            let mut assignment = ChannelAssignment::Independent;
+            let mut min_bits = cl.bits + cr.bits;
+            for (bits, ca) in [
+                (cl.bits + cs.bits, ChannelAssignment::LeftSide),
+                (cr.bits + cs.bits, ChannelAssignment::RightSide),
+                (cm.bits + cs.bits, ChannelAssignment::MidSide),
+            ] {
+                if bits < min_bits {
+                    min_bits = bits;
+                    assignment = ca;
+                }
+            }
+
+            write_frame_header(
+                &mut frame,
+                &FrameHeader {
+                    blocksize: bs as u32,
+                    sample_rate,
+                    channels,
+                    channel_assignment: assignment,
+                    bits_per_sample,
+                    frame_number,
+                },
+            );
+            // The two subframes to write, in stream order, per assignment.
+            let (first, second) = match assignment {
+                ChannelAssignment::Independent => (&cl, &cr),
+                ChannelAssignment::LeftSide => (&cl, &cs),
+                ChannelAssignment::RightSide => (&cs, &cr),
+                ChannelAssignment::MidSide => (&cm, &cs),
+            };
+            for cc in [first, second] {
+                write_choice(
+                    &mut frame,
+                    &cc.choice,
+                    &cc.signal,
+                    cc.subframe_bps,
+                    cc.wasted_bits,
+                );
+            }
+        } else {
+            write_frame_header(
+                &mut frame,
+                &FrameHeader {
+                    blocksize: bs as u32,
+                    sample_rate,
+                    channels,
+                    channel_assignment: ChannelAssignment::Independent,
+                    bits_per_sample,
+                    frame_number,
+                },
+            );
+            for c in 0..ch {
+                let signal: Vec<i32> = (0..bs).map(|i| interleaved[(start + i) * ch + c]).collect();
+                let cc = choose(signal, 0);
+                write_choice(
+                    &mut frame,
+                    &cc.choice,
+                    &cc.signal,
+                    cc.subframe_bps,
+                    cc.wasted_bits,
+                );
+            }
         }
 
         write_frame_footer(&mut frame);

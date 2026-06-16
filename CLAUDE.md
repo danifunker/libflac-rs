@@ -178,9 +178,16 @@ diffing at the first mismatching field to localize float drift.
   wasted-bits, and pure-sine-sweep corpora. Confirmed: `f32::cos`==glibc `cosf`,
   `f64::round`==glibc `lround` (half-away), plain `*` autocorrelation (no FMA), and
   the `frexp` exponent + `log2cmax--` shift derivation.
-- **F3** Mid-side channel decision (L/R vs M/S vs L/S vs R/S by estimated bits);
-  full corpus byte-exact at the real CHD level-8 config (`max_lpc_order = -1`,
-  `do_mid_side = -1`).
+- **F3 — DONE.** Per-frame stereo channel decision (`encoder.rs`): mid/side built
+  from the original L/R (`side = L-R`, `mid = (L+R)>>1`), each of L/R/M/S
+  independently wasted-bits-shifted and subframe-evaluated (side at +1 bps), then
+  the assignment with the fewest summed bits chosen (L/R vs L/S vs R/S vs M/S,
+  independent preferred on ties). `process_subframe` was split into a choose pass
+  + a deferred writer so the decision picks among already-evaluated subframes.
+  Byte-exact vs the oracle at the **real CHD level-8 preset** (`max_lpc_order = -1`,
+  `do_mid_side = -1`) across the decorrelated-noise corpus and crafted
+  identical/anti/scaled/independent L-R cases. **The first target (CHD/MAME
+  config) is now complete end-to-end.**
 - **F4** Public API, docs, CI (vendor a libFLAC subset for self-contained CI),
   publish. Optionally the CD subcode-split + `'L'`/`'B'` endian-trial wrapper, or
   leave that to chd-rs.

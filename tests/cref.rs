@@ -592,12 +592,25 @@ fn rust_frames_lpc(
     blocksize: u32,
     max_lpc_order: u32,
 ) -> Vec<u8> {
-    libflac_rs::testing::encode_frames(interleaved, channels, 16, 44_100, blocksize, max_lpc_order)
+    libflac_rs::testing::encode_frames(
+        interleaved,
+        channels,
+        16,
+        44_100,
+        blocksize,
+        max_lpc_order,
+        false,
+    )
 }
 
 /// Fixed-only Rust frame bytes (F1).
 fn rust_frames(interleaved: &[i32], channels: u32, blocksize: u32) -> Vec<u8> {
     rust_frames_lpc(interleaved, channels, blocksize, 0)
+}
+
+/// Full CHD level-8 config: LPC order 12 + the mid-side channel decision (F3).
+fn rust_frames_full(interleaved: &[i32], channels: u32, blocksize: u32) -> Vec<u8> {
+    libflac_rs::testing::encode_frames(interleaved, channels, 16, 44_100, blocksize, 12, true)
 }
 
 #[test]
@@ -724,6 +737,63 @@ fn lpc_pure_sine_match_c() {
         let rust = rust_frames_lpc(&pcm, 2, bs, 12);
         let c = c_encode(&pcm, 2, 16, bs, 12, 0);
         assert_eq!(rust, c, "[freq {freq}] LPC pure-sine bytes differ");
+    }
+}
+
+/// F3: the full CHD level-8 config — LPC order 12 **plus** the per-frame mid-side
+/// channel decision — byte-identical to the oracle's preset (`max_lpc_order=-1`,
+/// `do_mid_side=-1`). The decorrelated-noise corpus drives a mix of channel
+/// assignments across frames.
+#[test]
+fn full_config_mid_side_match_c() {
+    let bs = 2048u32;
+    for seed in 1..=60u32 {
+        let samples = bs as usize + (seed as usize * 263) % 3500;
+        let pcm = gen_pcm(seed, samples);
+        let rust = rust_frames_full(&pcm, 2, bs);
+        let c = c_encode(&pcm, 2, 16, bs, -1, -1); // real CHD level-8 preset
+        assert_eq!(
+            rust, c,
+            "[seed {seed}, {samples} samples] full-config bytes differ"
+        );
+    }
+}
+
+/// Crafted L/R relationships to force each of the four channel assignments
+/// (identical → mid/side, anti-correlated, scaled, fully independent).
+#[test]
+fn full_config_channel_assignments_match_c() {
+    let bs = 2048u32;
+    let n = bs as usize * 2 + 555;
+    let sine = |f: f64, amp: f64, phase: f64| -> Vec<i16> {
+        (0..n)
+            .map(|i| (amp * (i as f64 * f + phase).sin()).round() as i16)
+            .collect()
+    };
+    let l = sine(0.05, 10000.0, 0.0);
+    let cases: Vec<(&str, Vec<i16>, Vec<i16>)> = vec![
+        ("identical", l.clone(), l.clone()),
+        (
+            "anti",
+            l.clone(),
+            l.iter().map(|&x| x.saturating_neg()).collect(),
+        ),
+        (
+            "scaled",
+            l.clone(),
+            l.iter().map(|&x| (x as i32 * 3 / 4) as i16).collect(),
+        ),
+        (
+            "independent",
+            sine(0.05, 10000.0, 0.0),
+            sine(0.17, 8000.0, 1.1),
+        ),
+    ];
+    for (name, lc, rc) in cases {
+        let pcm = interleave(&lc, &rc);
+        let rust = rust_frames_full(&pcm, 2, bs);
+        let c = c_encode(&pcm, 2, 16, bs, -1, -1);
+        assert_eq!(rust, c, "[{name}] full-config bytes differ");
     }
 }
 
