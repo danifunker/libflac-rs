@@ -1,0 +1,45 @@
+[package]
+name = "libflac-rs"
+# Version scheme (shared with the sibling bit-exact ports, e.g. lzma-sdk-rs,
+# libzstd-bitexact-rs): 0.<flac-digits>.<patch>. The minor encodes the upstream
+# libFLAC release this crate is bit-exact with (1.4.3 -> 143); the patch counts
+# our own fixes against that target (0.143.1, 0.143.2, ...). The leading 0 marks
+# the public API as still unstable. Retargeting a new libFLAC bumps the minor.
+# Keep in sync with the git tag (v0.143.0).
+version = "0.143.0"
+edition = "2024"
+rust-version = "1.85"
+license = "BSD-3-Clause"
+description = "Bit-exact pure-Rust port of the libFLAC 1.4.3 encoder (byte-identical frame output to the C reference)."
+repository = "https://github.com/danifunker/libflac-rs"
+documentation = "https://docs.rs/libflac-rs"
+keywords = ["flac", "audio", "lossless", "chd", "encoder"]
+categories = ["multimedia::audio", "multimedia::encoding"]
+readme = "README.md"
+# The published crate is a pure-Rust, dependency-free library plus its proof
+# (src, tests, README/ROADMAP/LICENSE). Drop the AI dev guide, the CI config, and
+# the entire `cref/` differential rig — the vendored C oracle, the FFI shim, and
+# build.rs — none of which a consumer needs.
+exclude = ["/.github", "/CLAUDE.md", "/cref", "/build.rs"]
+
+[features]
+default = []
+# Dev/test only: compile the real libFLAC 1.4.3 C sources via build.rs and expose
+# them over FFI so tests can diff the Rust frame output against the C encoder
+# byte-for-byte. Requires a C compiler; glibc/gcc is the reference libm the
+# float-parity work targets. Not usable from the published crate (build.rs +
+# cref/ are excluded); run it from a repo checkout: `cargo test --features cref`.
+cref = []
+
+[lib]
+name = "libflac_rs"
+
+[build-dependencies]
+# Only used by build.rs under the `cref` feature (a repo checkout); the published
+# crate excludes build.rs, so consumers pull in nothing.
+cc = "1.2"
+
+[profile.dev]
+# The differential tests push the full corpus through both the Rust and C
+# encoders; opt-level 1 keeps debug test runs brisk.
+opt-level = 1

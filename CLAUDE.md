@@ -1,0 +1,189 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A pure-Rust, **bit-exact** port of **libFLAC 1.4.3** — ultimately a *complete*
+encoder **and** decoder whose output is byte-identical to the C reference.
+`flacenc` (the existing pure-Rust encoder) is **not** byte-identical to libFLAC;
+that is precisely why this exists: `chd-rs` and others need to *recreate* the exact
+bytes MAME/libFLAC produce, not merely emit a valid FLAC stream.
+
+**The first target is the configuration CHD/MAME uses** (level 8, 2ch/16-bit/
+44.1 kHz, streamable subset off, MD5 off, fixed block size) — built first because
+its float pipeline (windows → autocorrelation → Levinson → quantization) is the
+linchpin every config shares, and finishing one config end-to-end de-risks the
+float parity before fanning out. The project then **generalizes**: all bit depths
+(RICE2 + wide paths), all compression levels 0–8, the full apodization-window set,
+metadata blocks, MD5, the decoder, and (optionally) Ogg FLAC. See Milestones.
+
+**Success criterion:** for every input in the corpus, `libflac-rs` output equals
+the C libFLAC bytes for the same settings — verified live against the compiled C
+oracle (the `cref` feature), which can be configured for *any* libFLAC settings.
+
+This is bit-exactness-first work: a "working" codec that produces valid FLAC is
+**not** the goal if it differs from the C output by a single byte.
+
+## Commands
+
+```sh
+# Pure-Rust build/test (any platform); the published crate is pure Rust, zero deps.
+cargo build
+cargo test
+
+# Differential vs the C oracle. The oracle is the real libFLAC 1.4.3 compiled from
+# the sibling MAME tree under the `cref` feature. RUN THIS IN WSL (glibc): the C
+# oracle and Rust's f32/f64 transcendentals then resolve to the same libm.
+#   wsl bash -lc 'cd /mnt/c/.../libflac-rs && \
+#     CARGO_TARGET_DIR=$HOME/.cache/libflac-rs-target cargo test --features cref'
+cargo test --features cref
+
+cargo fmt
+cargo clippy --all-targets --features cref -- -D warnings
+```
+
+`FLAC_C_DIR` overrides the libFLAC source location (default
+`../mame/3rdparty/flac`). Set `CARGO_TARGET_DIR` to a native Linux path when
+building under WSL on a `/mnt/c` checkout — it keeps builds fast and avoids 9p
+quirks in `target/`.
+
+## Source of truth: the vendored C libFLAC
+
+The differential oracle is **libFLAC 1.4.3** (Xiph.Org, BSD-3-Clause), in the
+sibling checkout at `../mame/3rdparty/flac/`. `build.rs` compiles the scalar
+reference path under the `cref` feature; `cref/shim.c` drives the encoder and
+captures only the audio frames (write-callback `samples > 0`), discarding the
+stream marker + metadata exactly as CHD does. When porting or debugging a
+divergence, **read the C** — do not reconstruct logic from memory. Module
+doc-comments cite specific `*.c:NNN` lines; keep those citations accurate.
+
+Files in scope (scalar reference path only — see the SIMD note below):
+
+| C file | Rust module | Role |
+| --- | --- | --- |
+| `bitwriter.c`, `crc.c` | `bitwriter` | bit packing, CRC-8/CRC-16 |
+| `fixed.c` | `fixed` | fixed predictors (orders 0–4) + best-order |
+| `stream_encoder_framing.c` | `frame`, `subframe` | frame/subframe headers + footer |
+| `window.c` | `window` | apodization (`subdivide_tukey(3)`) |
+| `lpc.c` | `lpc/*` | windowing, autocorrelation, Levinson, quantize, residual |
+| `stream_encoder.c` | `encoder`, `rice` | orchestration, partition search, mid-side |
+| `format.c` | (constants) | header/validation constants |
+| `memory.c`, `md5.c` | — | replaced by Rust / skipped (MD5 off) |
+
+**Out of scope:** every `*_intrin_*` / `*_asm_*` translation unit, Ogg, metadata
+objects, the decoder (except as linked by the oracle's verify path). License is
+BSD-3-Clause; retain the Xiph copyright (see LICENSE).
+
+## The exact settings CHD uses
+
+`flac.cpp:77` / `chdcodec.cpp`: `set_verify(false)` (MD5 off),
+`set_compression_level(8)`, `set_channels(2)`, `set_bits_per_sample(16)`,
+`set_sample_rate(44100)`, `set_total_samples_estimate(0)`,
+`set_streamable_subset(false)`, `set_blocksize(block_size)` (typically **2048**).
+
+Level-8 preset (`stream_encoder.c:132`, last row): `do_mid_side=true`,
+`loose_mid_side=false`, `max_lpc_order=12`, `qlp_coeff_precision=0` (auto),
+`do_qlp_coeff_prec_search=false`, `do_escape_coding=false`,
+`do_exhaustive_model_search=false`, `min_residual_partition_order=0`,
+`max_residual_partition_order=6`, `rice_parameter_search_dist=0`,
+apodization `"subdivide_tukey(3)"`.
+
+## SIMD vs scalar — RESOLVED: scalar is the correct target
+
+The encoder makes its float decisions (windows, autocorrelation, LPC quant) where
+rounding must match the C reference. libFLAC ships SIMD autocorrelation variants
+that *can* diverge from the scalar `double` path (notably FMA: one rounding vs
+two). **But MAME compiles libFLAC without `FLAC__USE_AVX`** (verified:
+`scripts/src/3rdparty.lua` defines `HAVE_LROUND=1`, `ENABLE_64_BIT_WORDS=1`,
+`FLAC__HAS_OGG=0`, `NDEBUG`, `HAVE_CONFIG_H`, … but **never `FLAC__USE_AVX`**), and
+`cpu.h` gates `FLAC__AVX2_SUPPORTED`/`FLAC__FMA_SUPPORTED` behind `FLAC__USE_AVX`.
+So the FMA/AVX2 autocorrelation is **compiled out** of chdman.
+
+At level 8 (`max_lpc_order = 12`, so `lag = 13`) the dispatch
+(`stream_encoder.c:1018-1028`) therefore selects **`..._intrin_sse2_lag_14`**,
+which is plain `double`, no fused multiply. The scalar function itself
+(`lpc.c:133`) uses the same `deduplication/lpc_compute_autocorrelation_intrin.c`
+template (`autoc[j] += (double)data[i]*(double)data[i-j]`, MAX_LAG 8/12/16) for
+`lag ≤ 16`. Empirically, **scalar == MAME's exact SSE2 config, byte-identical
+across 60 randomized multi-partial+noise signals** (and structurally: same double
+math, no FMA).
+
+**Implication:** port the **scalar** autocorrelation template (plain `*` then `+`,
+no `mul_add`). The oracle is built with `FLAC__NO_ASM`, which is deterministic and
+platform-independent and matches x86 chdman. *Caveat:* CHDs created on ARM (NEON
+has FMA) could differ; the x86 path is the canonical target. To re-verify, build
+libFLAC two ways (scalar `-DFLAC__NO_ASM` vs MAME's full define set + the
+`*_intrin_*.c` files) and diff frame output — they must stay identical.
+
+## Bit-exactness hazards (FLOAT is the enemy)
+
+1. **Apodization windows** (`window.c`): coefficients via `cosf`/`fabsf` (f32).
+   Reproduce the exact float expressions and evaluation order. Build/run under
+   glibc so Rust's `f32::cos` and the oracle's `cosf` are the same libm; if any
+   per-coefficient drift appears, embed reference-computed tables.
+2. **Autocorrelation** (`lpc.c` template): accumulate in **`double`**, operands
+   promoted from `f32`. Plain `*` then `+` (NO `mul_add` — see the SIMD note).
+   Keep the exact loop/accumulation order.
+3. **Levinson-Durbin** (`lpc.c:176`): reflection coeff `r /= err` in `double`,
+   early `if(err == 0.0)` exit, round-to-nearest-even.
+4. **LPC quantization** (`lpc.c:~265`): `q = lround(error); error -= q;` with error
+   feedback. The oracle is built `HAVE_LROUND=1` → glibc `lround` (round half away
+   from zero, per C99 — *not* half-to-even). Match that explicitly (`f64::round`'s
+   half-away semantics + cast), verified against the oracle.
+5. **Auto qlp precision** (`lpc.c`): `min(15, 32 - subframe_bps - ilog2(order))`;
+   subframe_bps is 17 after mid-side. Get `ilog2` and bps right.
+6. **Rice partition search** (`stream_encoder.c:~4089`): integer, but tie-breaks
+   (first-best wins) must match. `do_escape_coding` is false at level 8.
+7. **Mid-side decision** (`stream_encoder.c:~3265`, `loose_mid_side=false`):
+   per-frame L/R vs M/S vs L/S vs R/S by estimated bits — replicate the estimate.
+8. **`f32` (`FLAC__real`) vs `f64`**: libFLAC stores LPC coeffs as `float` but
+   computes autocorrelation in `double`. Match each variable's type precisely.
+
+## Differential testing
+
+`build.rs` + `cref/shim.c` compile libFLAC under the `cref` feature and expose
+`libflac_rs_cref_encode(interleaved, nsamples, channels, bps, sample_rate,
+blocksize, max_lpc_order, do_mid_side, out, out_len)`. `max_lpc_order`/`do_mid_side`
+< 0 keep the level-8 preset; ≥ 0 override them for **staged testing**
+(`max_lpc_order = 0` forces fixed/constant/verbatim-only — used to bring up F1
+before the LPC float path exists). `tests/cref.rs` diffs Rust frame bytes against
+the oracle byte-for-byte. The shim symbols reach the integration-test binary via
+`cargo:rustc-link-arg-tests` whole-archive linkage (build-script `rustc-link-lib`
+does not reliably propagate to integration tests).
+
+Corpus: silence (→ CONSTANT), full-scale ±32767, sine sweeps (low → near-Nyquist),
+decorrelated noise (exercises mid-side), real 16-bit CD rips. Compare in stages —
+frame header → subframe header → qlp_coeff integers → residual/rice → CRC-16 —
+diffing at the first mismatching field to localize float drift.
+
+## Milestones
+
+- **F0 — DONE.** Bitwriter (`bitwriter.rs`) + CRC-8/16 (`crc.rs`); CRC byte-exact
+  vs `FLAC__crc8/16`.
+- **F1 — DONE.** CONSTANT/VERBATIM/FIXED subframes (`subframe.rs`, `fixed.rs`),
+  frame header/footer + UTF-8 frame number + block-size hints (`frame.rs`), the
+  integer Rice partition search (`rice.rs`), wasted-bits, and block orchestration
+  (`encoder.rs`). Byte-exact vs the oracle with `max_lpc_order = 0`, independent
+  stereo, across constant/short/sine+noise corpora. (The Rice partition search the
+  handoff slotted in F3 lives here, since FIXED needs it; F3 is now just mid-side.)
+- **F2** Windows + autocorrelation + Levinson + quantization — the **float-parity
+  gate**; byte-exact LPC subframes on sine/noise. The autocorrelation is the plain
+  `double` template (no `mul_add`); watch `cosf` and `lround` (glibc, half-away).
+- **F3** Mid-side channel decision (L/R vs M/S vs L/S vs R/S by estimated bits);
+  full corpus byte-exact at the real CHD level-8 config (`max_lpc_order = -1`,
+  `do_mid_side = -1`).
+- **F4** Public API, docs, CI (vendor a libFLAC subset for self-contained CI),
+  publish. Optionally the CD subcode-split + `'L'`/`'B'` endian-trial wrapper, or
+  leave that to chd-rs.
+
+## Conventions
+
+- Faithful transcription over "improved" Rust when bit-exactness is at stake;
+  idiomatic refactors are fine only for plumbing that cannot affect output bytes.
+- Keep `*.c:NNN` citations in module docs accurate when you touch the code.
+- Library is `#![forbid(unsafe_code)]`, edition 2024, MSRV 1.85, **zero runtime
+  dependencies** (pure `std`) — keep it that way. The only dependency is `cc`, a
+  build-dependency used solely by the `cref` oracle (excluded from the published
+  crate along with `build.rs` and `cref/`).
+- Version scheme `0.<flac-digits>.<patch>` (1.4.3 → `0.143.x`); git tag `v0.143.0`.
