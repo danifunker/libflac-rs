@@ -45,3 +45,7 @@ pub const ENTROPY_CODING_METHOD_PARTITIONED_RICE2_ESCAPE_PARAMETER: u32 = 31;
 
 pub const MAX_FIXED_ORDER: u32 = 4;
 pub const MAX_LPC_ORDER: u32 = 32;
+
+// QLP coefficient precision bounds (`FLAC__MIN/MAX_QLP_COEFF_PRECISION`).
+pub const MIN_QLP_COEFF_PRECISION: u32 = 5;
+pub const MAX_QLP_COEFF_PRECISION: u32 = 15;

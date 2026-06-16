@@ -167,9 +167,17 @@ diffing at the first mismatching field to localize float drift.
   (`encoder.rs`). Byte-exact vs the oracle with `max_lpc_order = 0`, independent
   stereo, across constant/short/sine+noise corpora. (The Rice partition search the
   handoff slotted in F3 lives here, since FIXED needs it; F3 is now just mid-side.)
-- **F2** Windows + autocorrelation + Levinson + quantization — the **float-parity
-  gate**; byte-exact LPC subframes on sine/noise. The autocorrelation is the plain
-  `double` template (no `mul_add`); watch `cosf` and `lround` (glibc, half-away).
+- **F2 — DONE.** The LPC float pipeline: `subdivide_tukey(3)` windows
+  (`window.rs`), windowing + `double` autocorrelation + Levinson + order/precision
+  selection + quantization + residual (`lpc/*`), `silog2`/`ilog2` (`bitmath.rs`),
+  the LPC subframe writer (`subframe.rs`), and the apodization a/b/c state machine
+  + `evaluate_lpc_subframe_` wired into `process_subframe` (`encoder.rs`). Each
+  stage is diffed against an exposed C leaf function (`cref/shim.c`), and full LPC
+  subframes are byte-exact vs the oracle (`max_lpc_order = 12`, `do_mid_side = 0`)
+  across block-multiple, short-final-frame, multi-blocksize (precision 7/9/10/12),
+  wasted-bits, and pure-sine-sweep corpora. Confirmed: `f32::cos`==glibc `cosf`,
+  `f64::round`==glibc `lround` (half-away), plain `*` autocorrelation (no FMA), and
+  the `frexp` exponent + `log2cmax--` shift derivation.
 - **F3** Mid-side channel decision (L/R vs M/S vs L/S vs R/S by estimated bits);
   full corpus byte-exact at the real CHD level-8 config (`max_lpc_order = -1`,
   `do_mid_side = -1`).

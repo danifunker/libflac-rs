@@ -14,6 +14,8 @@
 
 #include "FLAC/stream_encoder.h"
 #include "private/crc.h"
+#include "private/lpc.h"
+#include "private/window.h"
 
 /* CRC-8 / CRC-16 reference wrappers (FLAC__crc8/16, crc.c) for the F0
  * differential tests. */
@@ -120,4 +122,81 @@ int libflac_rs_cref_encode(const int32_t *interleaved, uint32_t nsamples,
     }
     *out_len = sink.len;
     return 0;
+}
+
+/* ---- F2 leaf-function wrappers --------------------------------------------
+ * Expose the individual float-pipeline stages so the Rust port can be diffed
+ * against the C reference one stage at a time (window -> windowing ->
+ * autocorrelation -> Levinson -> best-order -> quantize -> residual), localizing
+ * any float drift before the full LPC subframe is wired together. FLAC__real is
+ * `float`. The 2-D lp_coeff[order][FLAC__MAX_LPC_ORDER] array is flattened. */
+
+void libflac_rs_cref_window_tukey(float p, int32_t l, float *out) {
+    FLAC__window_tukey(out, l, p);
+}
+
+void libflac_rs_cref_lpc_window_data(const int32_t *in, const float *window,
+                                     float *out, uint32_t data_len) {
+    FLAC__lpc_window_data(in, window, out, data_len);
+}
+
+void libflac_rs_cref_lpc_window_data_partial(const int32_t *in,
+                                             const float *window, float *out,
+                                             uint32_t data_len,
+                                             uint32_t part_size,
+                                             uint32_t data_shift) {
+    FLAC__lpc_window_data_partial(in, window, out, data_len, part_size, data_shift);
+}
+
+void libflac_rs_cref_compute_autocorrelation(const float *data,
+                                             uint32_t data_len, uint32_t lag,
+                                             double *autoc) {
+    FLAC__lpc_compute_autocorrelation(data, data_len, lag, autoc);
+}
+
+/* Runs Levinson-Durbin; writes the order-1..max_order coefficient rows into the
+ * flat (FLAC__MAX_LPC_ORDER * FLAC__MAX_LPC_ORDER) buffer and the per-order error
+ * into `error`. Returns the (possibly reduced, on err==0) max_order. */
+uint32_t libflac_rs_cref_compute_lp_coefficients(const double *autoc,
+                                                 uint32_t max_order,
+                                                 float *lp_coeff_flat,
+                                                 double *error) {
+    FLAC__real lp_coeff[FLAC__MAX_LPC_ORDER][FLAC__MAX_LPC_ORDER];
+    uint32_t mo = max_order;
+    uint32_t i, j;
+    FLAC__lpc_compute_lp_coefficients(autoc, &mo, lp_coeff, error);
+    for (i = 0; i < FLAC__MAX_LPC_ORDER; i++)
+        for (j = 0; j < FLAC__MAX_LPC_ORDER; j++)
+            lp_coeff_flat[i * FLAC__MAX_LPC_ORDER + j] = lp_coeff[i][j];
+    return mo;
+}
+
+double libflac_rs_cref_expected_bits(double lpc_error, uint32_t total_samples) {
+    return FLAC__lpc_compute_expected_bits_per_residual_sample(lpc_error, total_samples);
+}
+
+uint32_t libflac_rs_cref_compute_best_order(const double *lpc_error,
+                                            uint32_t max_order,
+                                            uint32_t total_samples,
+                                            uint32_t overhead_bits_per_order) {
+    return FLAC__lpc_compute_best_order(lpc_error, max_order, total_samples,
+                                        overhead_bits_per_order);
+}
+
+int libflac_rs_cref_quantize_coefficients(const float *lp_coeff, uint32_t order,
+                                          uint32_t precision, int32_t *qlp_coeff,
+                                          int32_t *shift) {
+    int sh = 0;
+    int ret = FLAC__lpc_quantize_coefficients(lp_coeff, order, precision, qlp_coeff, &sh);
+    *shift = sh;
+    return ret;
+}
+
+/* `signal` points at the warmup; reads `order` history samples then produces
+ * blocksize-order residuals (mirrors evaluate_lpc_subframe_'s `signal+order`). */
+void libflac_rs_cref_compute_residual(const int32_t *signal, uint32_t blocksize,
+                                      const int32_t *qlp_coeff, uint32_t order,
+                                      int lp_quantization, int32_t *residual) {
+    FLAC__lpc_compute_residual_from_qlp_coefficients(
+        signal + order, blocksize - order, qlp_coeff, order, lp_quantization, residual);
 }

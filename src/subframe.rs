@@ -82,6 +82,66 @@ pub fn fixed_bits(order: u32, subframe_bps: u32, wasted_bits: u32, residual_bits
     }
 }
 
+/// LPC subframe (`FLAC__subframe_add_lpc`, `stream_encoder_framing.c:444`): header,
+/// `order` warmup samples, the `qlp_coeff_precision-1` field, the 5-bit
+/// quantization level (shift), the `order` quantized coefficients, then the
+/// partitioned-rice residual.
+#[allow(clippy::too_many_arguments)]
+pub fn write_lpc(
+    bw: &mut BitWriter,
+    order: u32,
+    warmup: &[i32],
+    qlp_coeff: &[i32],
+    precision: u32,
+    shift: i32,
+    subframe_bps: u32,
+    wasted_bits: u32,
+    residual: &[i32],
+    rice: &RicePartition,
+) {
+    write_subframe_header(
+        bw,
+        SUBFRAME_TYPE_LPC_BYTE_ALIGNED_MASK | ((order - 1) << 1),
+        wasted_bits,
+    );
+    for &w in warmup {
+        bw.write_raw_i64(w as i64, subframe_bps);
+    }
+    bw.write_raw_u32(precision - 1, SUBFRAME_LPC_QLP_COEFF_PRECISION_LEN);
+    bw.write_raw_i32(shift, SUBFRAME_LPC_QLP_SHIFT_LEN);
+    for &c in qlp_coeff {
+        bw.write_raw_i32(c, precision);
+    }
+    bw.write_raw_u32(
+        ENTROPY_CODING_METHOD_PARTITIONED_RICE,
+        ENTROPY_CODING_METHOD_TYPE_LEN,
+    );
+    bw.write_raw_u32(rice.order, ENTROPY_CODING_METHOD_PARTITIONED_RICE_ORDER_LEN);
+    write_residual_partitioned_rice(bw, residual, order, &rice.parameters, rice.order);
+}
+
+/// Bit cost of an LPC subframe (`evaluate_lpc_subframe_`, `stream_encoder.c:4043`):
+/// header + wasted + the precision/shift fields + `order*(precision+bps)` (warmup
+/// + coeffs) + residual estimate.
+pub fn lpc_bits(
+    order: u32,
+    precision: u32,
+    subframe_bps: u32,
+    wasted_bits: u32,
+    residual_bits: u32,
+) -> u32 {
+    let header = SUBFRAME_HEADER_LEN
+        + wasted_bits
+        + SUBFRAME_LPC_QLP_COEFF_PRECISION_LEN
+        + SUBFRAME_LPC_QLP_SHIFT_LEN
+        + order * (precision + subframe_bps);
+    if residual_bits < u32::MAX - header {
+        header + residual_bits
+    } else {
+        u32::MAX
+    }
+}
+
 /// Partitioned-rice residual (`add_residual_partitioned_rice_`,
 /// `stream_encoder_framing.c:538`). Escape coding is off, so every partition uses
 /// the plain-rice path with a 4-bit parameter.

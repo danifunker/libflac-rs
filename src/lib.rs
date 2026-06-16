@@ -21,18 +21,21 @@
 // Modules are added milestone by milestone:
 //   F0  bitwriter + crc            (bit packing, CRC-8/CRC-16)
 //   F1  fixed + subframe + frame   (CONSTANT/VERBATIM/FIXED, header/footer)
-//   F2  window + lpc/*             (the float-parity gate)
-//   F3  rice + mid-side            (partition search, channel assignment)
+//   F2  window + lpc/* + bitmath   (the LPC float-parity gate)
+//   F3  mid-side                   (channel assignment by estimated bits)
 //   F4  encoder                    (public API, level-8 preset wiring)
 
+mod bitmath;
 mod bitwriter;
 mod crc;
 mod encoder;
 mod fixed;
 mod format;
 mod frame;
+mod lpc;
 mod rice;
 mod subframe;
+mod window;
 
 /// Internals exposed **only** for the differential tests (`--features cref`). Not
 /// part of the public API and carries no stability guarantee; absent from the
@@ -43,4 +46,18 @@ pub mod testing {
     pub use crate::bitwriter::BitWriter;
     pub use crate::crc::{crc8, crc16};
     pub use crate::encoder::encode_frames;
+
+    /// Apodization windows, re-exported for per-element differential testing.
+    pub mod window {
+        pub use crate::window::tukey;
+    }
+
+    /// LPC float-pipeline stages, re-exported for stage-wise differential testing.
+    pub mod lpc {
+        pub use crate::lpc::{
+            LpCoefficients, Quantized, compute_autocorrelation, compute_best_order,
+            compute_lp_coefficients, compute_residual, expected_bits, quantize_coefficients,
+            window_data, window_data_partial,
+        };
+    }
 }
