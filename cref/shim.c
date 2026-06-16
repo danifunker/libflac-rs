@@ -61,10 +61,12 @@ static FLAC__StreamEncoderWriteStatus capture_frames(
  * fixed/constant/verbatim subframes only; do_mid_side selects independent vs
  * decorrelated stereo). *out_len is capacity on input, produced length on output.
  * Returns 0 on success, a negative code on failure. */
-int libflac_rs_cref_encode(const int32_t *interleaved, uint32_t nsamples,
-                           uint32_t channels, uint32_t bps, uint32_t sample_rate,
-                           uint32_t blocksize, int32_t max_lpc_order,
-                           int32_t do_mid_side, uint8_t *out, size_t *out_len) {
+int libflac_rs_cref_encode_cfg(const int32_t *interleaved, uint32_t nsamples,
+                               uint32_t channels, uint32_t bps,
+                               uint32_t sample_rate, uint32_t blocksize,
+                               int32_t compression_level, int32_t max_lpc_order,
+                               int32_t do_mid_side, uint8_t *out,
+                               size_t *out_len) {
     frame_sink sink;
     FLAC__StreamEncoder *enc;
     FLAC__StreamEncoderInitStatus init;
@@ -80,11 +82,13 @@ int libflac_rs_cref_encode(const int32_t *interleaved, uint32_t nsamples,
         return -1;
     }
 
-    /* Mirror CHD (flac.cpp:77, chdcodec.cpp): verify off, level 8, the fixed
-     * audio format, no total-samples estimate, streamable subset off, explicit
-     * block size, MD5 off (no effect on frame bytes; metadata is stripped). */
+    /* Mirror CHD (flac.cpp:77, chdcodec.cpp): verify off, the requested
+     * compression level (8 for CHD), the fixed audio format, no total-samples
+     * estimate, streamable subset off, explicit block size, MD5 off (no effect on
+     * frame bytes; metadata is stripped). */
     FLAC__stream_encoder_set_verify(enc, false);
-    FLAC__stream_encoder_set_compression_level(enc, 8);
+    FLAC__stream_encoder_set_compression_level(
+        enc, compression_level >= 0 ? (uint32_t)compression_level : 8);
     FLAC__stream_encoder_set_channels(enc, channels);
     FLAC__stream_encoder_set_bits_per_sample(enc, bps);
     FLAC__stream_encoder_set_sample_rate(enc, sample_rate);
@@ -122,6 +126,17 @@ int libflac_rs_cref_encode(const int32_t *interleaved, uint32_t nsamples,
     }
     *out_len = sink.len;
     return 0;
+}
+
+/* Backward-compatible entry point: the CHD level-8 config with the staged
+ * max_lpc_order / do_mid_side overrides. */
+int libflac_rs_cref_encode(const int32_t *interleaved, uint32_t nsamples,
+                           uint32_t channels, uint32_t bps, uint32_t sample_rate,
+                           uint32_t blocksize, int32_t max_lpc_order,
+                           int32_t do_mid_side, uint8_t *out, size_t *out_len) {
+    return libflac_rs_cref_encode_cfg(interleaved, nsamples, channels, bps,
+                                      sample_rate, blocksize, 8, max_lpc_order,
+                                      do_mid_side, out, out_len);
 }
 
 /* ---- F2 leaf-function wrappers --------------------------------------------

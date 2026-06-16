@@ -25,6 +25,19 @@ unsafe extern "C" {
         out: *mut u8,
         out_len: *mut usize,
     ) -> c_int;
+    fn libflac_rs_cref_encode_cfg(
+        interleaved: *const i32,
+        nsamples: u32,
+        channels: u32,
+        bps: u32,
+        sample_rate: u32,
+        blocksize: u32,
+        compression_level: i32,
+        max_lpc_order: i32,
+        do_mid_side: i32,
+        out: *mut u8,
+        out_len: *mut usize,
+    ) -> c_int;
     fn libflac_rs_cref_crc8(data: *const u8, len: u32) -> u8;
     fn libflac_rs_cref_crc16(data: *const u8, len: u32) -> u16;
 
@@ -115,6 +128,38 @@ fn c_encode(
         )
     };
     assert_eq!(rc, 0, "C encode returned {rc}");
+    out.truncate(out_len);
+    out
+}
+
+/// Encode via the C reference at an explicit compression level (no LPC/mid-side
+/// overrides), for the all-levels differential test.
+fn c_encode_level(
+    interleaved: &[i32],
+    channels: u32,
+    bps: u32,
+    blocksize: u32,
+    level: i32,
+) -> Vec<u8> {
+    let nsamples = (interleaved.len() / channels as usize) as u32;
+    let mut out = vec![0u8; interleaved.len() * 4 + 8192];
+    let mut out_len = out.len();
+    let rc = unsafe {
+        libflac_rs_cref_encode_cfg(
+            interleaved.as_ptr(),
+            nsamples,
+            channels,
+            bps,
+            44_100,
+            blocksize,
+            level,
+            -1,
+            -1,
+            out.as_mut_ptr(),
+            &mut out_len,
+        )
+    };
+    assert_eq!(rc, 0, "C encode_cfg returned {rc}");
     out.truncate(out_len);
     out
 }
@@ -585,22 +630,19 @@ fn compute_residual_matches_c() {
 // --- F1: CONSTANT / VERBATIM subframes + framing (fixed-only, independent) -----
 
 /// Rust frame bytes for interleaved 16-bit PCM, CHD's audio format. `max_lpc_order`
-/// mirrors the C staging knob (0 = fixed-only, 12 = level-8 LPC).
+/// mirrors the C staging knob (0 = fixed-only, 12 = level-8 LPC); independent
+/// channels, otherwise the level-8 settings (subdivide_tukey(3), max_po 6).
 fn rust_frames_lpc(
     interleaved: &[i32],
     channels: u32,
     blocksize: u32,
     max_lpc_order: u32,
 ) -> Vec<u8> {
-    libflac_rs::testing::encode_frames(
-        interleaved,
-        channels,
-        16,
-        44_100,
-        blocksize,
-        max_lpc_order,
-        false,
-    )
+    let mut cfg = libflac_rs::testing::preset(8);
+    cfg.max_lpc_order = max_lpc_order;
+    cfg.do_mid_side = false;
+    cfg.loose_mid_side = false;
+    libflac_rs::testing::encode_frames(interleaved, channels, 16, 44_100, blocksize, &cfg)
 }
 
 /// Fixed-only Rust frame bytes (F1).
@@ -610,7 +652,20 @@ fn rust_frames(interleaved: &[i32], channels: u32, blocksize: u32) -> Vec<u8> {
 
 /// Full CHD level-8 config: LPC order 12 + the mid-side channel decision (F3).
 fn rust_frames_full(interleaved: &[i32], channels: u32, blocksize: u32) -> Vec<u8> {
-    libflac_rs::testing::encode_frames(interleaved, channels, 16, 44_100, blocksize, 12, true)
+    libflac_rs::testing::encode_frames(
+        interleaved,
+        channels,
+        16,
+        44_100,
+        blocksize,
+        &libflac_rs::testing::preset(8),
+    )
+}
+
+/// Rust frame bytes at an explicit compression level (the all-levels test).
+fn rust_frames_level(interleaved: &[i32], channels: u32, blocksize: u32, level: u32) -> Vec<u8> {
+    let cfg = libflac_rs::testing::preset(level);
+    libflac_rs::testing::encode_frames(interleaved, channels, 16, 44_100, blocksize, &cfg)
 }
 
 #[test]
@@ -794,6 +849,62 @@ fn full_config_channel_assignments_match_c() {
         let rust = rust_frames_full(&pcm, 2, bs);
         let c = c_encode(&pcm, 2, 16, bs, -1, -1);
         assert_eq!(rust, c, "[{name}] full-config bytes differ");
+    }
+}
+
+/// Generalization: every compression level 0–8 byte-identical to the oracle's
+/// preset. Exercises the apodization variety (tukey(0.5) for 0–5,
+/// subdivide_tukey(2) for 6–7, subdivide_tukey(3) for 8), the loose mid-side mode
+/// (levels 1 and 4), fixed-only levels (0–2), and the differing LPC orders and
+/// partition-order caps. Non-block-multiple lengths cover short final frames.
+#[test]
+fn all_compression_levels_match_c() {
+    let bs = 2048u32;
+    for level in 0..=8u32 {
+        for seed in 1..=12u32 {
+            let samples = bs as usize + (seed as usize * 211) % 3500;
+            let pcm = gen_pcm(seed, samples);
+            let rust = rust_frames_level(&pcm, 2, bs, level);
+            let c = c_encode_level(&pcm, 2, 16, bs, level as i32);
+            assert_eq!(
+                rust, c,
+                "[level {level}, seed {seed}, {samples} samples] bytes differ"
+            );
+        }
+    }
+}
+
+/// Loose mid-side (levels 1, 4) over a long signal that crosses the ~9-frame
+/// re-decision boundary several times, so both the reuse and the periodic
+/// re-evaluation paths are exercised (plus a short final frame).
+#[test]
+fn loose_mid_side_long_signal_match_c() {
+    let bs = 2048u32;
+    let samples = bs as usize * 13 + 1000;
+    for level in [1u32, 4] {
+        for seed in 1..=4u32 {
+            let pcm = gen_pcm(seed, samples);
+            let rust = rust_frames_level(&pcm, 2, bs, level);
+            let c = c_encode_level(&pcm, 2, 16, bs, level as i32);
+            assert_eq!(rust, c, "[loose level {level}, seed {seed}] bytes differ");
+        }
+    }
+}
+
+/// Mono at assorted levels (the oracle disables mid-side for non-stereo at init,
+/// `stream_encoder.c:675`; the Rust path does too): exercises the independent path
+/// with each level's LPC order and apodization.
+#[test]
+fn mono_levels_match_c() {
+    let bs = 2048u32;
+    for level in [0u32, 2, 3, 5, 8] {
+        for seed in 1..=6u32 {
+            let stereo = gen_pcm(seed, bs as usize * 2 + 600);
+            let mono: Vec<i32> = stereo.iter().step_by(2).copied().collect();
+            let rust = rust_frames_level(&mono, 1, bs, level);
+            let c = c_encode_level(&mono, 1, 16, bs, level as i32);
+            assert_eq!(rust, c, "[mono level {level}, seed {seed}] bytes differ");
+        }
     }
 }
 

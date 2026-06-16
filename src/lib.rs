@@ -45,7 +45,7 @@ mod window;
 pub mod testing {
     pub use crate::bitwriter::BitWriter;
     pub use crate::crc::{crc8, crc16};
-    pub use crate::encoder::encode_frames;
+    pub use crate::encoder::{Apodization, Config, encode_frames, preset};
 
     /// Apodization windows, re-exported for per-element differential testing.
     pub mod window {

@@ -192,6 +192,20 @@ diffing at the first mismatching field to localize float drift.
   publish. Optionally the CD subcode-split + `'L'`/`'B'` endian-trial wrapper, or
   leave that to chd-rs.
 
+### Generalization (beyond the CHD slice)
+
+- **G1 — DONE (compression levels).** `encode_frames` takes a `Config`
+  (`encoder.rs`); `preset(0..=8)` reproduces `compression_levels_[]`. Adds the
+  `tukey(p)` apodization (single full window) alongside `subdivide_tukey(parts)`,
+  the per-level LPC-order / max-partition-order caps, and `loose_mid_side` (the
+  every-~0.4 s redecision used by levels 1 & 4). Byte-exact vs the oracle for all
+  levels 0–8 at 16-bit (stereo + mono), incl. the loose redecision boundary. The
+  shim gained `libflac_rs_cref_encode_cfg` (a `compression_level` knob).
+- **G2 (next) — bit depths.** 8/12/20/24/32-bit: RICE2 (5-bit params, escape 31)
+  above 16 bps, the wide/33-bit side residual paths, `window_data_wide`, and the
+  `>16`→RICE2 `rice_parameter_limit`. Then metadata blocks + MD5 (full-stream
+  output), then the decoder, then Ogg.
+
 ## Conventions
 
 - Faithful transcription over "improved" Rust when bit-exactness is at stake;

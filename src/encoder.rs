@@ -1,9 +1,11 @@
 //! Block/frame orchestration, ported from `process_frame_` /
 //! `process_subframes_` / `process_subframe_` (`stream_encoder.c`).
 //! CONSTANT/VERBATIM/FIXED/LPC subframes and, for stereo, the per-frame mid-side
-//! channel decision (L/R vs L/S vs R/S vs M/S by estimated bits) — the full
-//! level-8 config. This is the complete CHD/MAME slice; generalization to other
-//! bit depths/levels/windows comes later.
+//! channel decision (L/R vs L/S vs R/S vs M/S by estimated bits, including the
+//! `loose_mid_side` periodic-redecision mode). All compression levels 0–8 are
+//! supported via [`Config`]/[`preset`] (the `tukey(0.5)` / `subdivide_tukey(2|3)`
+//! apodizations and the per-level LPC-order / partition-order caps). Currently
+//! 16-bit; wider bit depths (RICE2, wide residual) come later.
 
 use crate::bitmath;
 use crate::bitwriter::BitWriter;
@@ -13,14 +15,81 @@ use crate::format::{
 use crate::frame::{ChannelAssignment, FrameHeader, write_frame_footer, write_frame_header};
 use crate::{fixed, lpc, rice, subframe, window};
 
-// Level-8 partition-order bounds, and the Rice parameter limit for a 16-bit
-// stream (escape parameter 15; RICE2 is only used above 16 bps).
+// Minimum residual partition order (0 for every compression level), and the Rice
+// parameter limit for a 16-bit stream (escape parameter 15; RICE2 is only used
+// above 16 bps).
 const MIN_RESIDUAL_PARTITION_ORDER: u32 = 0;
-const MAX_RESIDUAL_PARTITION_ORDER: u32 = 6;
 const RICE_PARAMETER_LIMIT_16BPS: u32 = 15;
 
-// Level-8 `subdivide_tukey(3)` apodization: parts = 3, Tukey p = 0.5/parts.
-const SUBDIVIDE_TUKEY_PARTS: i32 = 3;
+/// The apodization a compression level uses. Both variants ultimately window with
+/// a Tukey window; `SubdivideTukey` additionally evaluates the per-subdivision
+/// partial/punchout sub-windows via the a/b/c state machine.
+#[derive(Clone, Copy)]
+pub enum Apodization {
+    /// A single Tukey window of the given `p` (e.g. `tukey(0.5)`).
+    Tukey(f32),
+    /// `subdivide_tukey(parts)`: a Tukey window of `p = 0.5/parts` plus its
+    /// `parts`-deep partial/punchout subdivisions.
+    SubdivideTukey(i32),
+}
+
+impl Apodization {
+    /// The `p` of the underlying Tukey window.
+    fn window_p(self) -> f32 {
+        match self {
+            Apodization::Tukey(p) => p,
+            Apodization::SubdivideTukey(parts) => 0.5 / parts as f32,
+        }
+    }
+    fn subdivide_parts(self) -> i32 {
+        match self {
+            Apodization::Tukey(_) => 1,
+            Apodization::SubdivideTukey(parts) => parts,
+        }
+    }
+    fn is_subdivide(self) -> bool {
+        matches!(self, Apodization::SubdivideTukey(_))
+    }
+}
+
+/// The compression settings of one libFLAC compression level (the fields of
+/// `compression_levels_[]`, `stream_encoder.c:123`, that actually vary). The
+/// constant fields — `min_residual_partition_order = 0`, `qlp_coeff_precision = 0`
+/// (auto), and the escape/exhaustive/precision-search flags all `false` — are
+/// implied.
+#[derive(Clone, Copy)]
+pub struct Config {
+    pub do_mid_side: bool,
+    pub loose_mid_side: bool,
+    pub max_lpc_order: u32,
+    pub max_residual_partition_order: u32,
+    pub apodization: Apodization,
+}
+
+/// The preset for compression level `0..=8` (`compression_levels_[]`); levels
+/// above 8 clamp to 8.
+pub fn preset(level: u32) -> Config {
+    use Apodization::{SubdivideTukey, Tukey};
+    let (do_mid_side, loose_mid_side, max_lpc_order, max_residual_partition_order, apodization) =
+        match level {
+            0 => (false, false, 0, 3, Tukey(0.5)),
+            1 => (true, true, 0, 3, Tukey(0.5)),
+            2 => (true, false, 0, 3, Tukey(0.5)),
+            3 => (false, false, 6, 4, Tukey(0.5)),
+            4 => (true, true, 8, 4, Tukey(0.5)),
+            5 => (true, false, 8, 5, Tukey(0.5)),
+            6 => (true, false, 8, 6, SubdivideTukey(2)),
+            7 => (true, false, 12, 6, SubdivideTukey(2)),
+            _ => (true, false, 12, 6, SubdivideTukey(3)),
+        };
+    Config {
+        do_mid_side,
+        loose_mid_side,
+        max_lpc_order,
+        max_residual_partition_order,
+        apodization,
+    }
+}
 
 /// Detect and strip wasted (common trailing-zero) bits, mutating `signal` in
 /// place and returning the shift (`get_wasted_bits_`, `stream_encoder.c:4469`).
@@ -66,13 +135,13 @@ fn auto_qlp_coeff_precision(bits_per_sample: u32, blocksize: u32) -> u32 {
     }
 }
 
-/// Settings the LPC path needs (the level-8 subset), plus the precomputed window
-/// for the current frame's block size.
+/// Settings the LPC path needs, plus the precomputed window for the current
+/// frame's block size.
 struct LpcCtx<'a> {
     window: &'a [f32],
     max_lpc_order: u32,
     qlp_coeff_precision: u32,
-    parts: i32,
+    apodization: Apodization,
 }
 
 /// One fully-evaluated LPC subframe candidate.
@@ -151,18 +220,24 @@ fn apply_apodization(
     b: &mut u32,
     c: &mut u32,
 ) -> Option<(lpc::LpCoefficients, usize)> {
+    let parts = ctx.apodization.subdivide_parts();
     let lag = max_order + 1;
     if *b == 1 {
         // Window the full block (the "root" autocorrelation).
         lpc::window_data(signal, window, windowed, blocksize);
         lpc::compute_autocorrelation(&windowed[..blocksize], lag, autoc);
-        autoc_root[..max_order].copy_from_slice(&autoc[..max_order]);
-        *b += 1;
+        if ctx.apodization.is_subdivide() {
+            autoc_root[..max_order].copy_from_slice(&autoc[..max_order]);
+            *b += 1;
+        } else {
+            // A plain Tukey apodization is a single full-block window.
+            *a += 1;
+        }
     } else {
         let bb = *b as usize;
         if blocksize / bb <= MAX_LPC_ORDER as usize {
             // Windowing parts <= 32 samples is unsupported; skip and advance.
-            set_next_subdivide_tukey(ctx.parts, a, b, c);
+            set_next_subdivide_tukey(parts, a, b, c);
             return None;
         }
         if *c % 2 == 0 {
@@ -179,7 +254,7 @@ fn apply_apodization(
                 autoc[i] = autoc_root[i] - autoc[i];
             }
         }
-        set_next_subdivide_tukey(ctx.parts, a, b, c);
+        set_next_subdivide_tukey(parts, a, b, c);
     }
 
     if autoc[0] == 0.0 {
@@ -435,31 +510,41 @@ fn write_choice(
     }
 }
 
-/// Encode interleaved integer PCM into FLAC audio frames (no metadata).
-/// `max_lpc_order` mirrors the C staging knob (0 disables LPC; 12 = level 8), and
-/// `do_mid_side` enables the per-frame stereo channel decision (L/R vs L/S vs R/S
-/// vs M/S). The block size is fixed except for a possibly shorter final frame.
+/// Encode interleaved integer PCM into FLAC audio frames (no metadata) with the
+/// given compression `config`. For stereo with `do_mid_side`, each frame picks the
+/// channel assignment with the fewest bits (or, with `loose_mid_side`, re-decides
+/// only every ~0.4 s and reuses it between). The block size is fixed except for a
+/// possibly shorter final frame.
 pub fn encode_frames(
     interleaved: &[i32],
     channels: u32,
     bits_per_sample: u32,
     sample_rate: u32,
     blocksize: u32,
-    max_lpc_order: u32,
-    do_mid_side: bool,
+    config: &Config,
 ) -> Vec<u8> {
     let ch = channels as usize;
     assert!(ch > 0 && interleaved.len() % ch == 0, "ragged interleave");
     let total = interleaved.len() / ch;
-    let mid_side = do_mid_side && ch == 2;
+    let stereo_ms = config.do_mid_side && ch == 2;
 
     // Auto qlp precision is fixed once from the stream bps and the full block size.
     let qlp_coeff_precision = auto_qlp_coeff_precision(bits_per_sample, blocksize);
     // The apodization window, recomputed only when the frame block size changes
     // (i.e. once for the full frames, again for a short final frame).
-    let tukey_p = 0.5f32 / SUBDIVIDE_TUKEY_PARTS as f32;
+    let window_p = config.apodization.window_p();
     let mut window_bs = 0usize;
     let mut window_buf: Vec<f32> = Vec::new();
+
+    // Loose mid-side: re-decide the assignment only every `loose_frames` frames
+    // (`stream_encoder.c:894`), reusing it in between.
+    let loose_frames = if config.loose_mid_side {
+        ((sample_rate as f64 * 0.4 / blocksize as f64 + 0.5) as u32).max(1)
+    } else {
+        0
+    };
+    let mut loose_count = 0u32;
+    let mut last_assignment = ChannelAssignment::Independent;
 
     let mut out = Vec::new();
     let mut frame_number = 0u32;
@@ -468,23 +553,23 @@ pub fn encode_frames(
         let bs = (total - start).min(blocksize as usize);
 
         // Per-frame Rice partition-order bounds (`process_subframes_:3163`). The
-        // C clamps min to max (`flac_min`); at level 8 min is 0 so that is a no-op,
-        // and `find_best_partition_order` re-clamps min against the limited max.
-        let max_partition_order =
-            rice::max_partition_order_from_blocksize(bs as u32).min(MAX_RESIDUAL_PARTITION_ORDER);
+        // C clamps min to max (`flac_min`); min is 0 so that is a no-op, and
+        // `find_best_partition_order` re-clamps min against the limited max.
+        let max_partition_order = rice::max_partition_order_from_blocksize(bs as u32)
+            .min(config.max_residual_partition_order);
         let min_partition_order = MIN_RESIDUAL_PARTITION_ORDER;
 
         // (Re)compute the window for this block size if LPC is enabled.
-        if max_lpc_order > 0 && bs > 1 && bs != window_bs {
+        if config.max_lpc_order > 0 && bs > 1 && bs != window_bs {
             window_buf = vec![0f32; bs];
-            window::tukey(&mut window_buf, tukey_p);
+            window::tukey(&mut window_buf, window_p);
             window_bs = bs;
         }
-        let lpc_ctx = (max_lpc_order > 0 && bs > 1).then(|| LpcCtx {
+        let lpc_ctx = (config.max_lpc_order > 0 && bs > 1).then(|| LpcCtx {
             window: &window_buf,
-            max_lpc_order,
+            max_lpc_order: config.max_lpc_order,
             qlp_coeff_precision,
-            parts: SUBDIVIDE_TUKEY_PARTS,
+            apodization: config.apodization,
         });
 
         // Wasted-bits-shift a channel signal, then choose its best subframe.
@@ -516,33 +601,62 @@ pub fn encode_frames(
 
         let mut frame = BitWriter::new();
 
-        if mid_side {
-            // Mid/side are formed from the *original* (pre-wasted-shift) left and
-            // right (`process_subframes_:3210`): side = L - R, mid = (L + R) >> 1.
+        if stereo_ms {
             let left: Vec<i32> = (0..bs).map(|i| interleaved[(start + i) * ch]).collect();
             let right: Vec<i32> = (0..bs).map(|i| interleaved[(start + i) * ch + 1]).collect();
-            let mid: Vec<i32> = (0..bs).map(|i| (left[i] + right[i]) >> 1).collect();
-            let side: Vec<i32> = (0..bs).map(|i| left[i] - right[i]).collect();
+            // Mid/side from the *original* (pre-wasted-shift) L/R
+            // (`process_subframes_:3210`): side = L - R, mid = (L + R) >> 1.
+            let mid_side = || {
+                let mid: Vec<i32> = (0..bs).map(|i| (left[i] + right[i]) >> 1).collect();
+                let side: Vec<i32> = (0..bs).map(|i| left[i] - right[i]).collect();
+                (mid, side)
+            };
 
-            let cl = choose(left, 0);
-            let cr = choose(right, 0);
-            let cm = choose(mid, 0);
-            let cs = choose(side, 1);
-
-            // Smallest total frame wins; independent is preferred on ties (the C
-            // starts there and replaces only on strict improvement, ca = 1..3).
-            let mut assignment = ChannelAssignment::Independent;
-            let mut min_bits = cl.bits + cr.bits;
-            for (bits, ca) in [
-                (cl.bits + cs.bits, ChannelAssignment::LeftSide),
-                (cr.bits + cs.bits, ChannelAssignment::RightSide),
-                (cm.bits + cs.bits, ChannelAssignment::MidSide),
-            ] {
-                if bits < min_bits {
-                    min_bits = bits;
-                    assignment = ca;
-                }
-            }
+            // Between loose decision points, reuse the last assignment and encode
+            // only the channels it needs.
+            let (assignment, pair): (ChannelAssignment, [ChosenChannel; 2]) =
+                if config.loose_mid_side && loose_count != 0 {
+                    if last_assignment == ChannelAssignment::Independent {
+                        (
+                            ChannelAssignment::Independent,
+                            [choose(left, 0), choose(right, 0)],
+                        )
+                    } else {
+                        let (mid, side) = mid_side();
+                        (
+                            ChannelAssignment::MidSide,
+                            [choose(mid, 0), choose(side, 1)],
+                        )
+                    }
+                } else {
+                    let (mid, side) = mid_side();
+                    let cl = choose(left, 0);
+                    let cr = choose(right, 0);
+                    let cm = choose(mid, 0);
+                    let cs = choose(side, 1);
+                    // Smallest total wins, independent preferred on ties. Loose
+                    // decision frames consider only independent vs mid-side.
+                    let mut assignment = ChannelAssignment::Independent;
+                    let mut min_bits = cl.bits + cr.bits;
+                    let all = !config.loose_mid_side;
+                    for (enabled, bits, ca) in [
+                        (all, cl.bits + cs.bits, ChannelAssignment::LeftSide),
+                        (all, cr.bits + cs.bits, ChannelAssignment::RightSide),
+                        (true, cm.bits + cs.bits, ChannelAssignment::MidSide),
+                    ] {
+                        if enabled && bits < min_bits {
+                            min_bits = bits;
+                            assignment = ca;
+                        }
+                    }
+                    let pair = match assignment {
+                        ChannelAssignment::Independent => [cl, cr],
+                        ChannelAssignment::LeftSide => [cl, cs],
+                        ChannelAssignment::RightSide => [cs, cr],
+                        ChannelAssignment::MidSide => [cm, cs],
+                    };
+                    (assignment, pair)
+                };
 
             write_frame_header(
                 &mut frame,
@@ -555,14 +669,7 @@ pub fn encode_frames(
                     frame_number,
                 },
             );
-            // The two subframes to write, in stream order, per assignment.
-            let (first, second) = match assignment {
-                ChannelAssignment::Independent => (&cl, &cr),
-                ChannelAssignment::LeftSide => (&cl, &cs),
-                ChannelAssignment::RightSide => (&cs, &cr),
-                ChannelAssignment::MidSide => (&cm, &cs),
-            };
-            for cc in [first, second] {
+            for cc in &pair {
                 write_choice(
                     &mut frame,
                     &cc.choice,
@@ -570,6 +677,14 @@ pub fn encode_frames(
                     cc.subframe_bps,
                     cc.wasted_bits,
                 );
+            }
+
+            last_assignment = assignment;
+            if config.loose_mid_side {
+                loose_count += 1;
+                if loose_count >= loose_frames {
+                    loose_count = 0;
+                }
             }
         } else {
             write_frame_header(
