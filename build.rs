@@ -17,17 +17,28 @@ fn main() {
     }
 
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    // Default to the libFLAC 1.4.3 tree vendored in the sibling MAME checkout.
-    // Override with FLAC_C_DIR to point at a different libFLAC source tree (must
-    // contain include/FLAC/ and src/libFLAC/).
+    // Prefer the vendored libFLAC 1.4.3 (`cref/vendor/flac`) so CI and a fresh
+    // checkout are self-contained; fall back to the sibling MAME tree if the
+    // vendor dir is absent. Override either with FLAC_C_DIR (a libFLAC source tree
+    // containing include/FLAC/ and src/libFLAC/).
     let flac = std::env::var_os("FLAC_C_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            manifest
-                .join("..")
-                .join("mame")
-                .join("3rdparty")
-                .join("flac")
+            let vendored = manifest.join("cref").join("vendor").join("flac");
+            if vendored
+                .join("src")
+                .join("libFLAC")
+                .join("stream_encoder.c")
+                .exists()
+            {
+                vendored
+            } else {
+                manifest
+                    .join("..")
+                    .join("mame")
+                    .join("3rdparty")
+                    .join("flac")
+            }
         });
 
     let libflac = flac.join("src").join("libFLAC");
