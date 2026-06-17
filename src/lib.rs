@@ -26,6 +26,7 @@
 //   F4  encoder                    (public API, level-8 preset wiring)
 
 mod bitmath;
+mod bitreader;
 mod bitwriter;
 mod crc;
 mod encoder;
