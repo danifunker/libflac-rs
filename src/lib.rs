@@ -29,6 +29,7 @@ mod bitmath;
 mod bitreader;
 mod bitwriter;
 mod crc;
+mod decoder;
 mod encoder;
 mod fixed;
 mod format;
@@ -48,6 +49,7 @@ mod window;
 pub mod testing {
     pub use crate::bitwriter::BitWriter;
     pub use crate::crc::{crc8, crc16};
+    pub use crate::decoder::{DecodedFrames, decode_frames};
     pub use crate::encoder::{Apodization, Config, encode, encode_frames, preset};
     pub use crate::md5::audio_md5;
     pub use crate::metadata::LIBFLAC_VENDOR_STRING;
