@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn full_stream_round_trip_with_md5() {
         use crate::encoder::encode;
-        use crate::metadata::LIBFLAC_VENDOR_STRING;
+        use crate::metadata::{LIBFLAC_VENDOR_STRING, MetadataBlock};
         let bs = 2048u32;
         for &bps in &[8u32, 16, 24, 32] {
             for level in [0u32, 8] {
@@ -488,8 +488,7 @@ mod tests {
                     bs,
                     &preset(level),
                     true,
-                    Some(LIBFLAC_VENDOR_STRING),
-                    0,
+                    &[MetadataBlock::VorbisComment(LIBFLAC_VENDOR_STRING)],
                 );
                 let dec = decode(&stream).expect("decode full stream");
                 assert_eq!(dec.interleaved, pcm, "[bps {bps} level {level}] PCM");

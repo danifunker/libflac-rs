@@ -24,9 +24,44 @@ pub struct StreamInfo {
 /// Metadata block type codes.
 const METADATA_TYPE_STREAMINFO: u32 = 0;
 const METADATA_TYPE_PADDING: u32 = 1;
+const METADATA_TYPE_APPLICATION: u32 = 2;
 const METADATA_TYPE_VORBIS_COMMENT: u32 = 4;
 /// STREAMINFO body length in bytes.
 const STREAMINFO_LENGTH: u32 = 34;
+
+/// A metadata block the caller can place after STREAMINFO (which the encoder
+/// always writes first). libFLAC writes blocks in the order given (the OGG
+/// reorder is compiled out for native FLAC), so this list maps 1:1 to the output.
+pub enum MetadataBlock<'a> {
+    /// A VORBIS_COMMENT with the given vendor string and no user comments.
+    VorbisComment(&'a str),
+    /// A PADDING block of N zero bytes.
+    Padding(u32),
+    /// An APPLICATION block: a 4-byte registered application id + opaque data.
+    Application { id: [u8; 4], data: &'a [u8] },
+}
+
+/// Write one [`MetadataBlock`] with its `is_last` flag.
+pub fn write_block(bw: &mut BitWriter, block: &MetadataBlock, is_last: bool) {
+    match block {
+        MetadataBlock::VorbisComment(vendor) => write_vorbis_comment(bw, vendor, is_last),
+        MetadataBlock::Padding(len) => write_padding(bw, *len, is_last),
+        MetadataBlock::Application { id, data } => write_application(bw, id, data, is_last),
+    }
+}
+
+/// Write an APPLICATION block: 4-byte id then the application data
+/// (`FLAC__metadata_object_application`; body length = 4 + data length).
+pub fn write_application(bw: &mut BitWriter, id: &[u8; 4], data: &[u8], is_last: bool) {
+    write_block_header(
+        bw,
+        is_last,
+        METADATA_TYPE_APPLICATION,
+        4 + data.len() as u32,
+    );
+    bw.write_byte_block(id);
+    bw.write_byte_block(data);
+}
 
 /// The vendor string libFLAC 1.4.3 writes into its auto VORBIS_COMMENT
 /// (`FLAC__VENDOR_STRING` = `"reference libFLAC " PACKAGE_VERSION " 20230623"`

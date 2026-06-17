@@ -250,6 +250,78 @@ int libflac_rs_cref_encode_full(const int32_t *interleaved, uint32_t nsamples,
     return 0;
 }
 
+/* Encode a complete FLAC stream with one APPLICATION metadata block set (via a
+ * manually-filled FLAC__StreamMetadata, serialized by FLAC__add_metadata_block).
+ * Used to verify the Rust APPLICATION block byte-for-byte. With metadata set
+ * explicitly, libFLAC does not auto-insert a VORBIS_COMMENT (HAS_OGG=0, no
+ * reorder), so the output is STREAMINFO + APPLICATION + frames. */
+int libflac_rs_cref_encode_full_app(const int32_t *interleaved, uint32_t nsamples,
+                                    uint32_t channels, uint32_t bps,
+                                    uint32_t sample_rate, uint32_t blocksize,
+                                    int32_t compression_level, int32_t do_md5,
+                                    const uint8_t *app_id, const uint8_t *app_data,
+                                    uint32_t app_data_len, uint8_t *out,
+                                    size_t *out_len) {
+    mem_sink sink;
+    FLAC__StreamEncoder *enc;
+    FLAC__StreamEncoderInitStatus init;
+    FLAC__StreamMetadata app;
+    FLAC__StreamMetadata *metas[1];
+    int rc = 0;
+
+    sink.buf = out;
+    sink.cap = *out_len;
+    sink.pos = 0;
+    sink.len = 0;
+    sink.overflow = 0;
+
+    enc = FLAC__stream_encoder_new();
+    if (!enc) {
+        return -1;
+    }
+
+    FLAC__stream_encoder_set_verify(enc, false);
+    FLAC__stream_encoder_set_compression_level(
+        enc, compression_level >= 0 ? (uint32_t)compression_level : 8);
+    FLAC__stream_encoder_set_channels(enc, channels);
+    FLAC__stream_encoder_set_bits_per_sample(enc, bps);
+    FLAC__stream_encoder_set_sample_rate(enc, sample_rate);
+    FLAC__stream_encoder_set_total_samples_estimate(enc, 0);
+    FLAC__stream_encoder_set_streamable_subset(enc, false);
+    FLAC__stream_encoder_set_blocksize(enc, blocksize);
+    FLAC__stream_encoder_set_do_md5(enc, do_md5 != 0);
+
+    memset(&app, 0, sizeof(app));
+    app.type = FLAC__METADATA_TYPE_APPLICATION;
+    app.is_last = false; /* the encoder sets is_last on the final block */
+    app.length = 4 + app_data_len;
+    memcpy(app.data.application.id, app_id, 4);
+    app.data.application.data = (FLAC__byte *)app_data;
+    metas[0] = &app;
+    FLAC__stream_encoder_set_metadata(enc, metas, 1);
+
+    init = FLAC__stream_encoder_init_stream(enc, mem_write, mem_seek, mem_tell,
+                                            NULL, &sink);
+    if (init != FLAC__STREAM_ENCODER_INIT_STATUS_OK) {
+        FLAC__stream_encoder_delete(enc);
+        return -100 - (int)init;
+    }
+    if (!FLAC__stream_encoder_process_interleaved(enc, interleaved, nsamples)) {
+        rc = -200 - (int)FLAC__stream_encoder_get_state(enc);
+    } else if (!FLAC__stream_encoder_finish(enc)) {
+        rc = -300 - (int)FLAC__stream_encoder_get_state(enc);
+    }
+    FLAC__stream_encoder_delete(enc);
+    if (rc != 0) {
+        return rc;
+    }
+    if (sink.overflow) {
+        return -2;
+    }
+    *out_len = sink.len;
+    return 0;
+}
+
 /* ---- Decoder round-trip --------------------------------------------------
  * Decode a complete in-memory FLAC stream back to interleaved PCM via the real
  * libFLAC decoder, to prove the Rust full-stream output is a valid, decodable

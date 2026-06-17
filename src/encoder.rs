@@ -788,12 +788,12 @@ fn encode_frames_inner(
 }
 
 /// Encode interleaved integer PCM into a complete FLAC stream: the `fLaC` marker,
-/// metadata blocks, then the audio frames. `do_md5` controls whether STREAMINFO
-/// carries the audio MD5 (libFLAC's `--no-md5-sum` writes zeros). `vendor`, when
-/// `Some`, writes a VORBIS_COMMENT block with that vendor string and no comments
-/// (pass [`metadata::LIBFLAC_VENDOR_STRING`] to match libFLAC's default output);
-/// `padding` (> 0) appends a PADDING block of that many bytes. The last metadata
-/// block written carries the `is_last` flag.
+/// STREAMINFO, the given metadata `blocks` (in order), then the audio frames.
+/// `do_md5` controls whether STREAMINFO carries the audio MD5 (libFLAC's
+/// `--no-md5-sum` writes zeros). `blocks` are written after STREAMINFO exactly as
+/// supplied — pass a single [`metadata::MetadataBlock::VorbisComment`] with
+/// [`metadata::LIBFLAC_VENDOR_STRING`] to match libFLAC's default output. The last
+/// block written (STREAMINFO if `blocks` is empty) carries the `is_last` flag.
 #[allow(clippy::too_many_arguments)]
 pub fn encode(
     interleaved: &[i32],
@@ -803,8 +803,7 @@ pub fn encode(
     blocksize: u32,
     config: &Config,
     do_md5: bool,
-    vendor: Option<&str>,
-    padding: u32,
+    blocks: &[metadata::MetadataBlock],
 ) -> Vec<u8> {
     let ch = channels as usize;
     assert!(ch > 0 && interleaved.len() % ch == 0, "ragged interleave");
@@ -837,17 +836,11 @@ pub fn encode(
         md5,
     };
 
-    let has_vorbis = vendor.is_some();
-    let has_padding = padding > 0;
-
     let mut bw = BitWriter::new();
     bw.write_byte_block(b"fLaC");
-    metadata::write_streaminfo(&mut bw, &si, !has_vorbis && !has_padding);
-    if let Some(v) = vendor {
-        metadata::write_vorbis_comment(&mut bw, v, !has_padding);
-    }
-    if has_padding {
-        metadata::write_padding(&mut bw, padding, true);
+    metadata::write_streaminfo(&mut bw, &si, blocks.is_empty());
+    for (i, block) in blocks.iter().enumerate() {
+        metadata::write_block(&mut bw, block, i + 1 == blocks.len());
     }
     let mut out = bw.as_bytes().to_vec();
     out.extend_from_slice(&frames);

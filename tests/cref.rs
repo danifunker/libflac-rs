@@ -10,6 +10,7 @@
 //! nothing without the feature.
 #![cfg(feature = "cref")]
 
+use libflac_rs::testing::MetadataBlock;
 use std::os::raw::c_int;
 
 unsafe extern "C" {
@@ -54,6 +55,22 @@ unsafe extern "C" {
         data: *const u8,
         len: usize,
         out: *mut i32,
+        out_len: *mut usize,
+    ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    fn libflac_rs_cref_encode_full_app(
+        interleaved: *const i32,
+        nsamples: u32,
+        channels: u32,
+        bps: u32,
+        sample_rate: u32,
+        blocksize: u32,
+        compression_level: i32,
+        do_md5: i32,
+        app_id: *const u8,
+        app_data: *const u8,
+        app_data_len: u32,
+        out: *mut u8,
         out_len: *mut usize,
     ) -> c_int;
     fn libflac_rs_cref_vendor_string(out: *mut u8, cap: usize) -> usize;
@@ -383,8 +400,7 @@ fn streaminfo_matches_c() {
                     bs,
                     &libflac_rs::testing::preset(level),
                     do_md5,
-                    None,
-                    0,
+                    &[],
                 );
                 let c = c_encode_full(&pcm, 2, 16, bs, level as i32, do_md5);
                 assert_eq!(&rust[0..4], b"fLaC", "rust marker");
@@ -418,8 +434,10 @@ fn full_stream_round_trips() {
                 bs,
                 &libflac_rs::testing::preset(level),
                 true,
-                Some("libflac-rs round-trip"),
-                100,
+                &[
+                    MetadataBlock::VorbisComment("libflac-rs round-trip"),
+                    MetadataBlock::Padding(100),
+                ],
             );
             let mut decoded = vec![0i32; pcm.len()];
             let mut dlen = decoded.len();
@@ -472,8 +490,7 @@ fn full_stream_matches_c_default() {
                 bs,
                 &libflac_rs::testing::preset(level),
                 true,
-                Some(vendor),
-                0,
+                &[MetadataBlock::VorbisComment(vendor)],
             );
             let c = c_encode_full(&pcm, 2, 16, bs, level as i32, true);
             assert_eq!(
@@ -1243,8 +1260,7 @@ fn wider_depth_full_stream_matches_c() {
                     bs,
                     &libflac_rs::testing::preset(level),
                     true,
-                    Some(vendor),
-                    0,
+                    &[MetadataBlock::VorbisComment(vendor)],
                 );
                 let c = c_encode_full(&pcm, 2, bps, bs, level as i32, true);
                 assert_eq!(
@@ -1253,6 +1269,67 @@ fn wider_depth_full_stream_matches_c() {
                 );
             }
         }
+    }
+}
+
+/// Phase 8: an APPLICATION metadata block must serialize byte-identically to
+/// libFLAC. The C side sets a manually-filled APPLICATION block; the full stream
+/// (STREAMINFO + APPLICATION + frames, no auto VORBIS_COMMENT once metadata is
+/// set) must match the Rust `MetadataBlock::Application` output.
+#[test]
+fn application_metadata_matches_c() {
+    let bs = 2048u32;
+    let pcm = gen_pcm_bps(3, bs as usize + 200, 16);
+    let id = *b"riff";
+    let data: Vec<u8> = (0..53u8).map(|i| i.wrapping_mul(7)).collect();
+    // libFLAC auto-inserts its default VORBIS_COMMENT (vendor) ahead of any
+    // user metadata, so include it explicitly to compare like-for-like.
+    let vendor = libflac_rs::testing::LIBFLAC_VENDOR_STRING;
+    for level in [0u32, 8] {
+        let rust = libflac_rs::testing::encode(
+            &pcm,
+            2,
+            16,
+            44_100,
+            bs,
+            &libflac_rs::testing::preset(level),
+            true,
+            &[
+                MetadataBlock::VorbisComment(vendor),
+                MetadataBlock::Application { id, data: &data },
+            ],
+        );
+        let mut out = vec![0u8; pcm.len() * 4 + 8192];
+        let mut out_len = out.len();
+        let rc = unsafe {
+            libflac_rs_cref_encode_full_app(
+                pcm.as_ptr(),
+                (pcm.len() / 2) as u32,
+                2,
+                16,
+                44_100,
+                bs,
+                level as i32,
+                1,
+                id.as_ptr(),
+                data.as_ptr(),
+                data.len() as u32,
+                out.as_mut_ptr(),
+                &mut out_len,
+            )
+        };
+        assert_eq!(rc, 0, "C encode_full_app returned {rc}");
+        out.truncate(out_len);
+        assert_eq!(
+            rust, out,
+            "[level {level}] APPLICATION stream differs from C"
+        );
+        // And it round-trips through our own decoder.
+        let dec = libflac_rs::testing::decode(&rust).expect("decode");
+        assert_eq!(
+            dec.interleaved, pcm,
+            "[level {level}] APPLICATION round-trip"
+        );
     }
 }
 
