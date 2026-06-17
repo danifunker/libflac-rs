@@ -51,6 +51,104 @@ pub fn decode_frames(data: &[u8]) -> Option<DecodedFrames> {
     })
 }
 
+/// A fully decoded FLAC stream (`fLaC` marker + metadata + frames).
+pub struct DecodedStream {
+    pub interleaved: Vec<i32>,
+    pub channels: u32,
+    pub bits_per_sample: u32,
+    pub sample_rate: u32,
+    pub total_samples: u64,
+    /// The STREAMINFO MD5 (all-zero if the encoder had MD5 off).
+    pub md5: [u8; 16],
+    /// Whether the decoded audio's MD5 matches STREAMINFO (trivially `true` when
+    /// STREAMINFO carries no MD5).
+    pub md5_ok: bool,
+}
+
+/// Decode a complete FLAC stream: the `fLaC` marker, the metadata blocks (only
+/// STREAMINFO is interpreted; the rest are skipped), then the audio frames.
+/// Verifies the audio MD5 against STREAMINFO when present. `None` on malformed
+/// input or any CRC mismatch.
+pub fn decode(data: &[u8]) -> Option<DecodedStream> {
+    let mut br = BitReader::new(data);
+    if br.read_raw_u32(32)? != 0x664c_6143 {
+        return None; // "fLaC"
+    }
+
+    let mut info: Option<StreamInfo> = None;
+    loop {
+        let is_last = br.read_raw_u32(1)? == 1;
+        let block_type = br.read_raw_u32(7)?;
+        let length = br.read_raw_u32(24)? as usize;
+        if block_type == 0 {
+            // STREAMINFO (34 bytes).
+            let _min_bs = br.read_raw_u32(16)?;
+            let _max_bs = br.read_raw_u32(16)?;
+            let _min_fs = br.read_raw_u32(24)?;
+            let _max_fs = br.read_raw_u32(24)?;
+            let sample_rate = br.read_raw_u32(20)?;
+            let channels = br.read_raw_u32(3)? + 1;
+            let bits_per_sample = br.read_raw_u32(5)? + 1;
+            let total_samples = br.read_raw_u64(36)?;
+            let mut md5 = [0u8; 16];
+            for b in &mut md5 {
+                *b = br.read_raw_u32(8)? as u8;
+            }
+            info = Some(StreamInfo {
+                sample_rate,
+                channels,
+                bits_per_sample,
+                total_samples,
+                md5,
+            });
+        } else {
+            br.skip_bytes(length)?;
+        }
+        if is_last {
+            break;
+        }
+    }
+    let info = info?;
+
+    let mut interleaved = Vec::new();
+    while br.byte_pos() < data.len() {
+        let frame = decode_frame(&mut br, data)?;
+        for i in 0..frame.blocksize {
+            for ch in &frame.samples {
+                interleaved.push(ch[i]);
+            }
+        }
+    }
+    // Trim any encoder padding beyond the declared length.
+    if info.total_samples > 0 {
+        interleaved.truncate(info.total_samples as usize * info.channels as usize);
+    }
+
+    let md5_ok = info.md5 == [0u8; 16] || {
+        let computed =
+            crate::md5::audio_md5(&interleaved, info.bits_per_sample.div_ceil(8) as usize);
+        computed == info.md5
+    };
+
+    Some(DecodedStream {
+        interleaved,
+        channels: info.channels,
+        bits_per_sample: info.bits_per_sample,
+        sample_rate: info.sample_rate,
+        total_samples: info.total_samples,
+        md5: info.md5,
+        md5_ok,
+    })
+}
+
+struct StreamInfo {
+    sample_rate: u32,
+    channels: u32,
+    bits_per_sample: u32,
+    total_samples: u64,
+    md5: [u8; 16],
+}
+
 struct Frame {
     blocksize: usize,
     channels: u32,
@@ -315,7 +413,7 @@ fn sign_extend5(v: u32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_frames;
+    use super::{decode, decode_frames};
     use crate::encoder::{encode_frames, preset};
 
     /// Multi-partial + noise PCM scaled to a `bps`-bit range, `channels` wide.
@@ -369,6 +467,34 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn full_stream_round_trip_with_md5() {
+        use crate::encoder::encode;
+        use crate::metadata::LIBFLAC_VENDOR_STRING;
+        let bs = 2048u32;
+        for &bps in &[8u32, 16, 24, 32] {
+            for level in [0u32, 8] {
+                let pcm = gen_pcm(9, bs as usize + 555, bps, 2);
+                // do_md5 = true, the libFLAC vendor string, no padding.
+                let stream = encode(
+                    &pcm,
+                    2,
+                    bps,
+                    44_100,
+                    bs,
+                    &preset(level),
+                    true,
+                    Some(LIBFLAC_VENDOR_STRING),
+                    0,
+                );
+                let dec = decode(&stream).expect("decode full stream");
+                assert_eq!(dec.interleaved, pcm, "[bps {bps} level {level}] PCM");
+                assert_eq!(dec.total_samples, (pcm.len() / 2) as u64);
+                assert!(dec.md5_ok, "[bps {bps} level {level}] MD5 mismatch");
             }
         }
     }

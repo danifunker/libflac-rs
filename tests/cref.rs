@@ -1256,6 +1256,33 @@ fn wider_depth_full_stream_matches_c() {
     }
 }
 
+/// The decoder against **real libFLAC output**: decode complete streams the C
+/// reference produced (marker + metadata + frames, MD5 on) and confirm the PCM is
+/// reproduced exactly and the embedded MD5 verifies — across every bit depth.
+#[test]
+fn decode_libflac_streams() {
+    let bs = 2048u32;
+    for &bps in &[8u32, 12, 16, 20, 24, 32] {
+        for level in [0u32, 5, 8] {
+            for seed in 1..=2u32 {
+                let pcm = gen_pcm_bps(seed, bs as usize + 600, bps);
+                let c = c_encode_full(&pcm, 2, bps, bs, level as i32, true);
+                let dec = libflac_rs::testing::decode(&c).expect("decode libFLAC stream");
+                assert_eq!(dec.channels, 2);
+                assert_eq!(dec.bits_per_sample, bps);
+                assert!(
+                    dec.md5_ok,
+                    "[bps {bps} level {level} seed {seed}] MD5 verify"
+                );
+                assert_eq!(
+                    dec.interleaved, pcm,
+                    "[bps {bps} level {level} seed {seed}] decoded PCM differs"
+                );
+            }
+        }
+    }
+}
+
 fn lcg(state: &mut u32) -> u32 {
     *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
     *state

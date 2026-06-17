@@ -143,6 +143,17 @@ impl<'a> BitReader<'a> {
         self.pos = (self.pos + 7) & !7;
     }
 
+    /// Skip `n` bytes (must be byte-aligned); used to step over metadata blocks.
+    /// Returns `None` if that runs past the end.
+    pub fn skip_bytes(&mut self, n: usize) -> Option<()> {
+        debug_assert!(self.is_byte_aligned());
+        if n * 8 > self.bits_left() {
+            return None;
+        }
+        self.pos += n * 8;
+        Some(())
+    }
+
     /// The backing bytes in `[start, self.byte_pos())` — for CRC over a
     /// byte-aligned region just read.
     pub fn bytes_since(&self, start: usize) -> &'a [u8] {
