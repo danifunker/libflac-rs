@@ -73,6 +73,28 @@ unsafe extern "C" {
         out: *mut u8,
         out_len: *mut usize,
     ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    fn libflac_rs_cref_encode_full_picture(
+        interleaved: *const i32,
+        nsamples: u32,
+        channels: u32,
+        bps: u32,
+        sample_rate: u32,
+        blocksize: u32,
+        compression_level: i32,
+        do_md5: i32,
+        picture_type: u32,
+        mime: *const u8,
+        desc: *const u8,
+        width: u32,
+        height: u32,
+        depth: u32,
+        colors: u32,
+        pic_data: *const u8,
+        pic_data_len: u32,
+        out: *mut u8,
+        out_len: *mut usize,
+    ) -> c_int;
     fn libflac_rs_cref_vendor_string(out: *mut u8, cap: usize) -> usize;
     fn libflac_rs_cref_crc8(data: *const u8, len: u32) -> u8;
     fn libflac_rs_cref_crc16(data: *const u8, len: u32) -> u16;
@@ -1331,6 +1353,74 @@ fn application_metadata_matches_c() {
             "[level {level}] APPLICATION round-trip"
         );
     }
+}
+
+/// Phase 8: a PICTURE metadata block (cover art) must serialize byte-identically
+/// to libFLAC. As with APPLICATION, libFLAC prepends its default VORBIS_COMMENT.
+#[test]
+fn picture_metadata_matches_c() {
+    let bs = 2048u32;
+    let pcm = gen_pcm_bps(4, bs as usize + 150, 16);
+    let vendor = libflac_rs::testing::LIBFLAC_VENDOR_STRING;
+    let mime = "image/png";
+    let desc = "front cover";
+    let pic_data: Vec<u8> = (0..200u16).map(|i| (i * 3) as u8).collect();
+    let (ptype, w, h, depth, colors) = (3u32, 16u32, 16u32, 24u32, 0u32); // 3 = front cover
+    let rust = libflac_rs::testing::encode(
+        &pcm,
+        2,
+        16,
+        44_100,
+        bs,
+        &libflac_rs::testing::preset(8),
+        true,
+        &[
+            MetadataBlock::VorbisComment(vendor),
+            MetadataBlock::Picture {
+                picture_type: ptype,
+                mime_type: mime,
+                description: desc,
+                width: w,
+                height: h,
+                depth,
+                colors,
+                data: &pic_data,
+            },
+        ],
+    );
+    // NUL-terminate mime/desc for the C strlen path.
+    let mime_c = std::ffi::CString::new(mime).unwrap();
+    let desc_c = std::ffi::CString::new(desc).unwrap();
+    let mut out = vec![0u8; pcm.len() * 4 + 8192];
+    let mut out_len = out.len();
+    let rc = unsafe {
+        libflac_rs_cref_encode_full_picture(
+            pcm.as_ptr(),
+            (pcm.len() / 2) as u32,
+            2,
+            16,
+            44_100,
+            bs,
+            8,
+            1,
+            ptype,
+            mime_c.as_ptr() as *const u8,
+            desc_c.as_ptr() as *const u8,
+            w,
+            h,
+            depth,
+            colors,
+            pic_data.as_ptr(),
+            pic_data.len() as u32,
+            out.as_mut_ptr(),
+            &mut out_len,
+        )
+    };
+    assert_eq!(rc, 0, "C encode_full_picture returned {rc}");
+    out.truncate(out_len);
+    assert_eq!(rust, out, "PICTURE stream differs from C");
+    let dec = libflac_rs::testing::decode(&rust).expect("decode");
+    assert_eq!(dec.interleaved, pcm, "PICTURE round-trip");
 }
 
 /// The decoder against **real libFLAC output**: decode complete streams the C

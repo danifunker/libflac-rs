@@ -26,6 +26,7 @@ const METADATA_TYPE_STREAMINFO: u32 = 0;
 const METADATA_TYPE_PADDING: u32 = 1;
 const METADATA_TYPE_APPLICATION: u32 = 2;
 const METADATA_TYPE_VORBIS_COMMENT: u32 = 4;
+const METADATA_TYPE_PICTURE: u32 = 6;
 /// STREAMINFO body length in bytes.
 const STREAMINFO_LENGTH: u32 = 34;
 
@@ -39,6 +40,18 @@ pub enum MetadataBlock<'a> {
     Padding(u32),
     /// An APPLICATION block: a 4-byte registered application id + opaque data.
     Application { id: [u8; 4], data: &'a [u8] },
+    /// A PICTURE block (e.g. cover art). `mime_type`/`description` are stored with
+    /// 32-bit length prefixes; `picture_type` is the FLAC picture-type code.
+    Picture {
+        picture_type: u32,
+        mime_type: &'a str,
+        description: &'a str,
+        width: u32,
+        height: u32,
+        depth: u32,
+        colors: u32,
+        data: &'a [u8],
+    },
 }
 
 /// Write one [`MetadataBlock`] with its `is_last` flag.
@@ -47,6 +60,33 @@ pub fn write_block(bw: &mut BitWriter, block: &MetadataBlock, is_last: bool) {
         MetadataBlock::VorbisComment(vendor) => write_vorbis_comment(bw, vendor, is_last),
         MetadataBlock::Padding(len) => write_padding(bw, *len, is_last),
         MetadataBlock::Application { id, data } => write_application(bw, id, data, is_last),
+        MetadataBlock::Picture {
+            picture_type,
+            mime_type,
+            description,
+            width,
+            height,
+            depth,
+            colors,
+            data,
+        } => {
+            let mime = mime_type.as_bytes();
+            let desc = description.as_bytes();
+            // body = type + mime_len + mime + desc_len + desc + w/h/d/colors + data_len + data
+            let length = 4 + 4 + mime.len() + 4 + desc.len() + 16 + 4 + data.len();
+            write_block_header(bw, is_last, METADATA_TYPE_PICTURE, length as u32);
+            bw.write_raw_u32(*picture_type, 32);
+            bw.write_raw_u32(mime.len() as u32, 32);
+            bw.write_byte_block(mime);
+            bw.write_raw_u32(desc.len() as u32, 32);
+            bw.write_byte_block(desc);
+            bw.write_raw_u32(*width, 32);
+            bw.write_raw_u32(*height, 32);
+            bw.write_raw_u32(*depth, 32);
+            bw.write_raw_u32(*colors, 32);
+            bw.write_raw_u32(data.len() as u32, 32);
+            bw.write_byte_block(data);
+        }
     }
 }
 
