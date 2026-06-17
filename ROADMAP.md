@@ -7,9 +7,11 @@ reference to port, the data shapes, the bit-exactness traps, and how to verify.
 
 **Current status:** the encoder is byte-identical to libFLAC for the **CHD/MAME
 config** and has generalized to **all levels (0–8)**, **bit depths 8/12/16/20/24**,
-and **complete `.flac` files** at **every standard bit depth (8–32)**. Remaining:
-full metadata, the decoder, Ogg, and the public API. Phases **0–7 are DONE**;
-**8 onward are the work ahead.**
+and **complete `.flac` files** at **every standard bit depth (8–32)** — and a
+**decoder** that losslessly round-trips the encoder and reads real libFLAC output
+(MD5-verified). Phases **0–7 are DONE**, and **Phase 9's decoder core** too;
+remaining: full metadata (Phase 8), decoder seeking/streaming polish, Ogg
+(Phase 10), and the public API + publish (Phase 11).
 
 ```
 DONE   Phase 0  Bitwriter + CRC                      █████████
@@ -21,7 +23,8 @@ DONE   Phase 5  Metadata + MD5 (full streams)        █████████
 DONE   Phase 6  Bit depths 8/12/16/20/24 (RICE2)     █████████
 DONE   Phase 7  32-bit / wide-residual paths         █████████
 TODO   Phase 8  Full metadata blocks + user API      ░░░░░░░░░
-TODO   Phase 9  The decoder                          ░░░░░░░░░
+DONE*  Phase 9  The decoder (core: round-trips +      ████████░
+                 reads real libFLAC; polish left)
 TODO   Phase 10 Ogg FLAC (optional)                  ░░░░░░░░░
 TODO   Phase 11 Public API, docs, publish            ░░░░░░░░░
 ```
@@ -220,12 +223,18 @@ through libFLAC's decoder and compare parsed blocks.
 
 ---
 
-# TODO — Phase 9: the decoder (bit-exact, standalone)
+# DONE* — Phase 9: the decoder (core complete; seeking/streaming API left)
 
-**Goal:** a pure-Rust decoder that turns FLAC bytes back into the exact original
-PCM, with CRC and MD5 verification. Today libFLAC's decoder is linked only inside
-the oracle; this ports it for real. Largest single piece — build it in sub-steps,
-each diffed against the oracle's decode path (`libflac_rs_cref_decode`).
+**Status: the decode logic is implemented and verified.** A pure-Rust decoder
+(`bitreader.rs` + `decoder.rs`) turns FLAC bytes back into the exact original PCM
+with CRC-8/CRC-16 and MD5 verification. It decodes **complete streams the C
+reference produced** (`decode_libflac_streams`) and **round-trips the whole
+encoder corpus losslessly** (`decode(encode(pcm)) == pcm`) across 8/12/16/20/24/32-bit,
+mono+stereo, levels 0–8, with the embedded MD5 verifying. All restore math is
+`i64`, so the 33-bit side channel is exact. Steps 1–7 below are done; **remaining
+polish:** variable-block-size streams (`read_utf8_u64` sample numbers), a
+SEEKTABLE-driven `seek()` (needs Phase 8), and an incremental/streaming decode API
+(folds into Phase 11). The implementation record follows.
 
 **Files (new):** `bitreader.rs`, `decoder.rs` (+ reuse `lpc::restore`,
 `fixed::restore`, `crc`, `md5`, `metadata` parsing).

@@ -224,7 +224,16 @@ diffing at the first mismatching field to localize float drift.
   32-bit signal is FIXED not CONSTANT); `get_wasted_bits_wide_` returns **shift 1**
   for an all-zero side; the **fixed subframe is skipped when `rbps >= subframe_bps`**
   (`stream_encoder.c:3561`); and rice selection **short-circuits on `mean < 2`**.
-  Frames + full streams byte-exact for all depths. Next: the decoder, then Ogg.
+  Frames + full streams byte-exact for all depths.
+- **D1 — decoder core DONE.** `bitreader.rs` (MSB-first reads, the decode mirror of
+  `bitwriter`) + `decoder.rs`: `decode_frames` (raw frames) and `decode` (full
+  stream — `fLaC` marker, STREAMINFO, skip other metadata, frames, MD5 verify).
+  Frame header (+CRC-8), all four subframe types, RICE/RICE2 residual (incl.
+  escape), `i64` fixed/LPC restore, L/S·R/S·M/S un-decorrelation, CRC-16. The
+  decoder is *not* byte-parity work — it's verified by **lossless round-trip**
+  (`decode(encode(pcm)) == pcm`, all depths/levels, MD5 ok) and by **decoding real
+  libFLAC output** (`decode_libflac_streams`). Remaining: variable block size
+  (`read_utf8_u64`), SEEKTABLE seeking, and a streaming API. Then metadata, Ogg.
 
 ## Conventions
 
