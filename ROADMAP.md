@@ -22,7 +22,8 @@ DONE   Phase 4  Compression levels 0–8               ████████�
 DONE   Phase 5  Metadata + MD5 (full streams)        █████████
 DONE   Phase 6  Bit depths 8/12/16/20/24 (RICE2)     █████████
 DONE   Phase 7  32-bit / wide-residual paths         █████████
-TODO   Phase 8  Full metadata blocks + user API      ░░░░░░░░░
+WIP    Phase 8  Metadata: framework + APPLICATION +   █████░░░░
+                 PICTURE done; SEEKTABLE/CUESHEET left
 DONE*  Phase 9  The decoder (core: round-trips +      ████████░
                  reads real libFLAC; polish left)
 TODO   Phase 10 Ogg FLAC (optional)                  ░░░░░░░░░
@@ -177,7 +178,17 @@ identical/anti/scaled L−R cases that force each channel assignment at 32-bit.
 
 ---
 
-# TODO — Phase 8: full metadata blocks + user metadata API
+# WIP — Phase 8: full metadata blocks + user metadata API
+
+**Status: framework + APPLICATION + PICTURE done.** `metadata::MetadataBlock`
+(VorbisComment / Padding / Application / Picture) is the user-metadata API;
+`encode()` takes an ordered `&[MetadataBlock]` after STREAMINFO. APPLICATION and
+PICTURE serialize **byte-identically to libFLAC** (verified via manually-filled C
+metadata structs in the shim — which also revealed libFLAC auto-prepends its
+default VORBIS_COMMENT to any user metadata) and round-trip through the decoder.
+**Remaining: SEEKTABLE** (needs generation — spaced points + per-frame offset fill
+during encode, coupled to `encode_frames_inner`) and **CUESHEET** (niche; a
+nested track/index structure). The plan below covers those.
 
 **Goal:** emit every standard metadata block and let callers supply them, in
 libFLAC's canonical order (STREAMINFO first, user blocks next, PADDING last, with
