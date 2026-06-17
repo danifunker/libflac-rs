@@ -221,6 +221,12 @@ fn c_encode_full(
     out
 }
 
+/// Widen i32 samples to the encoder's unified i64 channel type (the leaf
+/// LPC/fixed stages take i64; the C oracle leaves take i32 — same values).
+fn to_i64(s: &[i32]) -> Vec<i64> {
+    s.iter().map(|&x| x as i64).collect()
+}
+
 /// Stereo-interleave two channels of i16 (as i32, sign-extended) PCM.
 fn interleave(left: &[i16], right: &[i16]) -> Vec<i32> {
     assert_eq!(left.len(), right.len());
@@ -522,11 +528,12 @@ fn lpc_window_data_matches_c() {
     for &bs in &[2048usize, 4096, 1024] {
         for seed in 1..=8u32 {
             let sig = mono_signal(seed, bs);
+            let sig64 = to_i64(&sig);
             let mut win = vec![0f32; bs];
             libflac_rs::testing::window::tukey(&mut win, level8_p);
 
             let mut rust = vec![0f32; bs];
-            libflac_rs::testing::lpc::window_data(&sig, &win, &mut rust, bs);
+            libflac_rs::testing::lpc::window_data(&sig64, &win, &mut rust, bs);
             let mut c = vec![0f32; bs];
             unsafe {
                 libflac_rs_cref_lpc_window_data(
@@ -561,12 +568,13 @@ fn lpc_window_data_partial_matches_c() {
     let configs = [(2usize, 0usize), (2, 1024), (3, 0), (3, 682), (3, 1365)];
     for seed in 1..=6u32 {
         let sig = mono_signal(seed, bs);
+        let sig64 = to_i64(&sig);
         for &(b, shift) in &configs {
             let part_size = bs / b / 2;
             let read_len = bs / b;
             let mut rust = vec![0f32; bs];
             libflac_rs::testing::lpc::window_data_partial(
-                &sig, &win, &mut rust, bs, part_size, shift,
+                &sig64, &win, &mut rust, bs, part_size, shift,
             );
             let mut c = vec![0f32; bs];
             unsafe {
@@ -607,10 +615,11 @@ fn compute_autocorrelation_matches_c() {
     ] {
         for seed in 1..=8u32 {
             let sig = mono_signal(seed, bs);
+            let sig64 = to_i64(&sig);
             let mut win = vec![0f32; bs];
             libflac_rs::testing::window::tukey(&mut win, level8_p);
             let mut windowed = vec![0f32; bs];
-            libflac_rs::testing::lpc::window_data(&sig, &win, &mut windowed, bs);
+            libflac_rs::testing::lpc::window_data(&sig64, &win, &mut windowed, bs);
 
             // The C routine writes MAX_LAG (lag rounded up to the 8/12/16 bucket)
             // values, not `lag`; the encoder sizes this buffer at MAX_LPC_ORDER+1.
@@ -639,7 +648,7 @@ fn compute_autocorrelation_matches_c() {
 /// Compute the autocorrelation for a real-ish signal via the verified Rust
 /// window+autocorr stages, for feeding the Levinson tests.
 fn autoc_for(seed: u32, bs: usize, lag: usize) -> Vec<f64> {
-    let sig = mono_signal(seed, bs);
+    let sig = to_i64(&mono_signal(seed, bs));
     let mut win = vec![0f32; bs];
     libflac_rs::testing::window::tukey(&mut win, 0.5f32 / 3.0);
     let mut windowed = vec![0f32; bs];
@@ -795,10 +804,11 @@ fn compute_residual_matches_c() {
     let bs = 2048usize;
     for seed in 1..=16u32 {
         let sig = mono_signal(seed, bs);
+        let sig64 = to_i64(&sig);
         let mut win = vec![0f32; bs];
         libflac_rs::testing::window::tukey(&mut win, 0.5f32 / 3.0);
         let mut windowed = vec![0f32; bs];
-        libflac_rs::testing::lpc::window_data(&sig, &win, &mut windowed, bs);
+        libflac_rs::testing::lpc::window_data(&sig64, &win, &mut windowed, bs);
         let mut autoc = vec![0f64; 33];
         libflac_rs::testing::lpc::compute_autocorrelation(&windowed, 13, &mut autoc);
         let lp = libflac_rs::testing::lpc::compute_lp_coefficients(&autoc, 12);
@@ -813,7 +823,7 @@ fn compute_residual_matches_c() {
                 Err(_) => continue,
             };
             let rust =
-                libflac_rs::testing::lpc::compute_residual(&sig, order, &q.qlp_coeff, q.shift);
+                libflac_rs::testing::lpc::compute_residual(&sig64, order, &q.qlp_coeff, q.shift);
             let mut c = vec![0i32; bs - order];
             unsafe {
                 libflac_rs_cref_compute_residual(
@@ -1156,12 +1166,12 @@ fn gen_pcm_bps(seed: u32, samples_per_channel: usize, bps: u32) -> Vec<i32> {
     out
 }
 
-/// G3: wider bit depths. 8/12-bit use RICE; 20/24-bit use RICE2. (32-bit, which
-/// needs the 33-bit side channel, is covered separately.) Byte-exact across levels.
+/// G3: wider bit depths. 8/12-bit use RICE; 20/24/32-bit use RICE2; 32-bit also
+/// exercises the 33-bit side channel + wide residual. Byte-exact across levels.
 #[test]
 fn bit_depths_match_c() {
     let bs = 2048u32;
-    for &bps in &[8u32, 12, 20, 24] {
+    for &bps in &[8u32, 12, 20, 24, 32] {
         for level in [0u32, 5, 8] {
             for seed in 1..=4u32 {
                 let samples = bs as usize + (seed as usize * 191) % 2000;
@@ -1177,6 +1187,41 @@ fn bit_depths_match_c() {
     }
 }
 
+/// Crafted 32-bit stereo cases that force each channel assignment and drive the
+/// 33-bit side past `i32` (anti-correlated / independent full-range), exercising
+/// the wide fixed-validity and LPC-bail paths. Byte-exact vs the oracle.
+#[test]
+fn wide_32bit_channel_cases_match_c() {
+    let bs = 2048u32;
+    let n = bs as usize * 2 + 300;
+    let mut x = 0x9e37_79b9u32;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        x as i32 // full-range i32 from the PRNG bits
+    };
+    for case in 0..4 {
+        let mut pcm = Vec::with_capacity(n * 2);
+        for _ in 0..n {
+            let l = next();
+            let r = match case {
+                0 => l,                            // identical -> side 0 (constant)
+                1 => l.wrapping_neg(),             // anti -> mid 0, side ~33-bit
+                2 => next(),                       // independent full-range
+                _ => l.wrapping_add(next() >> 12), // near-correlated -> small side
+            };
+            pcm.push(l);
+            pcm.push(r);
+        }
+        for level in [0u32, 5, 8] {
+            let rust = rust_frames_level_bps(&pcm, 2, bs, level, 32);
+            let c = c_encode_level(&pcm, 2, 32, bs, level as i32);
+            assert_eq!(rust, c, "[32-bit case {case} level {level}] frames differ");
+        }
+    }
+}
+
 /// Wider bit depths through the **full** pipeline: complete stream (STREAMINFO
 /// with the wider bps + 3-byte/etc. MD5, VORBIS_COMMENT, frames) byte-identical to
 /// libFLAC's default output for 8/12/20/24-bit.
@@ -1186,7 +1231,7 @@ fn wider_depth_full_stream_matches_c() {
     let mut buf = [0u8; 128];
     let len = unsafe { libflac_rs_cref_vendor_string(buf.as_mut_ptr(), buf.len()) };
     let vendor = std::str::from_utf8(&buf[..len]).unwrap();
-    for &bps in &[8u32, 12, 20, 24] {
+    for &bps in &[8u32, 12, 20, 24, 32] {
         for level in [0u32, 5, 8] {
             for seed in 1..=3u32 {
                 let pcm = gen_pcm_bps(seed, bs as usize + 700, bps);

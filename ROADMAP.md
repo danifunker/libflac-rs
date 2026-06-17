@@ -7,8 +7,9 @@ reference to port, the data shapes, the bit-exactness traps, and how to verify.
 
 **Current status:** the encoder is byte-identical to libFLAC for the **CHD/MAME
 config** and has generalized to **all levels (0–8)**, **bit depths 8/12/16/20/24**,
-and **complete `.flac` files**. Remaining: 32-bit, full metadata, the decoder,
-Ogg, and the public API. Phases **0–6 are DONE**; **7 onward are the work ahead.**
+and **complete `.flac` files** at **every standard bit depth (8–32)**. Remaining:
+full metadata, the decoder, Ogg, and the public API. Phases **0–7 are DONE**;
+**8 onward are the work ahead.**
 
 ```
 DONE   Phase 0  Bitwriter + CRC                      █████████
@@ -18,7 +19,7 @@ DONE   Phase 3  Mid-side  → CHD target complete      ████████�
 DONE   Phase 4  Compression levels 0–8               █████████
 DONE   Phase 5  Metadata + MD5 (full streams)        █████████
 DONE   Phase 6  Bit depths 8/12/16/20/24 (RICE2)     █████████
-TODO   Phase 7  32-bit / wide-residual paths         ░░░░░░░░░
+DONE   Phase 7  32-bit / wide-residual paths         █████████
 TODO   Phase 8  Full metadata blocks + user API      ░░░░░░░░░
 TODO   Phase 9  The decoder                          ░░░░░░░░░
 TODO   Phase 10 Ogg FLAC (optional)                  ░░░░░░░░░
@@ -97,12 +98,30 @@ verified leaf-by-leaf via `cref/shim.c`.
 
 ---
 
-# TODO — Phase 7: 32-bit / wide-residual paths (finish bit depths)
+# ✅ DONE — Phase 7: 32-bit / wide-residual paths
 
-**Goal:** 32-bit input byte-identical at every level. The blocker is integer
-**overflow**: `side = L−R` is 33-bit and `mid = (L+R)>>1` plus the fixed/LPC
-residuals exceed `i32`. libFLAC keeps the side channel in `i64` and uses "wide" /
-"limit" residual routines that bail when a residual won't fit `i32`.
+**Status: implemented and verified** — 32-bit input is byte-identical at every
+level (frames + full streams), so **all standard bit depths (8–32) are done.** The
+channel signal is now carried as **`i64`** throughout, so `side = L−R` (33-bit) and
+`mid = (L+R)>>1` never overflow; ≤24-bit values fit `i32` and stay byte-identical
+to before. Beyond the overflow handling in the plan below, **five libFLAC quirks**
+had to be matched exactly (and are precisely what the decoder, Phase 9, must
+reverse):
+
+- **Constant detection is disabled at `subframe_bps >= 28`** — the `_limit_residual`
+  predictor's `CHECK_ORDER_IS_VALID` reports `rbps[1] = 34.0` (never `0.0`) for a
+  constant signal, so a constant 32-bit signal becomes FIXED, not CONSTANT.
+- **`get_wasted_bits_wide_` returns shift 1** for an all-zero 33-bit side (vs 0).
+- **Fixed residuals wrap** (`i64`→`i32`) rather than bail; the order guess uses
+  per-order validity (`|residual| > i32::MAX` ⇒ that order is invalid).
+- **The fixed subframe is skipped when its estimated bits/sample ≥ `subframe_bps`**
+  (`stream_encoder.c:3561`), leaving VERBATIM for an incompressible wide signal.
+- **Rice selection short-circuits on `mean < 2`** (never forming `(mean-1)*divisor`)
+  — which also fixed a latent panic on any all-zero partition.
+
+The original implementation plan is kept below as the build record. **Overflow
+context:** `side = L−R` is 33-bit and `mid = (L+R)>>1` plus the fixed/LPC residuals
+exceed `i32`; the side is `i64` and the "wide"/"limit" residual routines handle it.
 
 **Files:** `fixed.rs`, `lpc/residual.rs`, `lpc/mod.rs` (windowing), `subframe.rs`,
 `encoder.rs`.

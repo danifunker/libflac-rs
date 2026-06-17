@@ -140,11 +140,19 @@ fn set_partitioned_rice(
         };
 
         let mean = abs_sums[partition];
-        let scaled = ((mean.wrapping_sub(1)) * u64::from(divisor)) >> 18;
-        let mut rice_parameter = if mean < 2 || scaled == 0 {
+        // Match libFLAC's short-circuit (`set_partitioned_rice_`,
+        // stream_encoder.c:4403): the `(mean-1)*divisor` product is only formed when
+        // `mean >= 2`, so an all-zero partition (`mean == 0`) never underflows. The
+        // `wrapping_mul` matches the C's well-defined `u64` wrap for huge blocksizes.
+        let mut rice_parameter = if mean < 2 {
             0
         } else {
-            ilog2_u64(scaled) + 1
+            let scaled = mean.wrapping_sub(1).wrapping_mul(u64::from(divisor)) >> 18;
+            if scaled == 0 {
+                0
+            } else {
+                ilog2_u64(scaled) + 1
+            }
         };
         if rice_parameter >= rice_parameter_limit {
             rice_parameter = rice_parameter_limit - 1;

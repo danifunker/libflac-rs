@@ -213,13 +213,18 @@ diffing at the first mismatching field to localize float drift.
   and no padding the **entire** stream is byte-identical to libFLAC's default
   output (`libflac_rs_cref_vendor_string` confirms the version string). Not yet
   written: SEEKTABLE / other metadata block types.
-- **G3 — bit depths (8/12/16/20/24 DONE; 32-bit pending).** RICE2 (5-bit params,
-  escape 31) is selected per partition when any rice parameter reaches 15
+- **G3 — DONE (all bit depths 8/12/16/20/24/32).** RICE2 (5-bit params, escape 31)
+  is selected per partition when any rice parameter reaches 15
   (`RicePartition::is_rice2`), driven by the `bps>16 ? 31 : 15` rice-parameter
-  limit; frames and full streams byte-exact for 8/12/16/20/24-bit. **32-bit** still
-  needs the 33-bit side channel + wide residual (`integer_signal_33bit_side`,
-  `_wide`/`_limit_residual`, `window_data_wide`): `side = L-R`/`mid = (L+R)>>1`
-  overflow `i32`. Then the decoder, then Ogg.
+  limit. **32-bit** carries the channel signal as `i64` throughout (so the 33-bit
+  `side = L-R` and `mid = (L+R)>>1` don't overflow); the fixed/LPC residuals are
+  computed wide and either wrap to `i32` (fixed) or bail (LPC `_limit_residual`).
+  Five libFLAC quirks were matched: constant detection is **off at `subframe_bps
+  >= 28`** (the `_limit_residual` predictor reports `rbps[1]=34.0`, so a constant
+  32-bit signal is FIXED not CONSTANT); `get_wasted_bits_wide_` returns **shift 1**
+  for an all-zero side; the **fixed subframe is skipped when `rbps >= subframe_bps`**
+  (`stream_encoder.c:3561`); and rice selection **short-circuits on `mean < 2`**.
+  Frames + full streams byte-exact for all depths. Next: the decoder, then Ogg.
 
 ## Conventions
 

@@ -15,15 +15,15 @@ use crate::bitmath::silog2;
 /// Compute `blocksize - order` residuals for the given quantized predictor.
 /// `signal` is the full subframe signal (warmup included); `shift` is the
 /// quantization level (`>= 0`).
-pub fn compute_residual(signal: &[i32], order: usize, qlp_coeff: &[i32], shift: i32) -> Vec<i32> {
+pub fn compute_residual(signal: &[i64], order: usize, qlp_coeff: &[i32], shift: i32) -> Vec<i32> {
     let data_len = signal.len() - order;
     let mut residual = vec![0i32; data_len];
     for i in 0..data_len {
         let mut sum = 0i64;
         for j in 0..order {
-            sum += qlp_coeff[j] as i64 * signal[order + i - 1 - j] as i64;
+            sum += qlp_coeff[j] as i64 * signal[order + i - 1 - j];
         }
-        residual[i] = (signal[order + i] as i64 - (sum >> shift)) as i32;
+        residual[i] = (signal[order + i] - (sum >> shift)) as i32;
     }
     residual
 }
@@ -32,7 +32,7 @@ pub fn compute_residual(signal: &[i32], order: usize, qlp_coeff: &[i32], shift: 
 /// if any residual would be `<= INT32_MIN` or `> INT32_MAX` (the C bails to "can't
 /// LPC at this order"); the encoder selects this path when `max_residual_bps > 32`.
 pub fn compute_residual_limit(
-    signal: &[i32],
+    signal: &[i64],
     order: usize,
     qlp_coeff: &[i32],
     shift: i32,
@@ -42,9 +42,9 @@ pub fn compute_residual_limit(
     for i in 0..data_len {
         let mut sum = 0i64;
         for j in 0..order {
-            sum += qlp_coeff[j] as i64 * signal[order + i - 1 - j] as i64;
+            sum += qlp_coeff[j] as i64 * signal[order + i - 1 - j];
         }
-        let r = signal[order + i] as i64 - (sum >> shift);
+        let r = signal[order + i] - (sum >> shift);
         if r <= i32::MIN as i64 || r > i32::MAX as i64 {
             return None;
         }

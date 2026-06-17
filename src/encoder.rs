@@ -4,9 +4,10 @@
 //! channel decision (L/R vs L/S vs R/S vs M/S by estimated bits, including the
 //! `loose_mid_side` periodic-redecision mode). All compression levels 0–8 are
 //! supported via [`Config`]/[`preset`] (the `tukey(0.5)` / `subdivide_tukey(2|3)`
-//! apodizations and the per-level LPC-order / partition-order caps). Bit depths
-//! 8/12/16/20/24 are supported (RICE2 entropy coding above 16 bps); 32-bit (the
-//! 33-bit side channel / wide residual paths) is still to come.
+//! apodizations and the per-level LPC-order / partition-order caps). All bit depths
+//! 8/12/16/20/24/32 are supported — RICE2 entropy coding above 16 bps, and for
+//! 32-bit input the 33-bit `i64` side channel plus the wide / overflow-limited
+//! residual paths.
 
 use crate::bitmath;
 use crate::bitwriter::BitWriter;
@@ -102,16 +103,23 @@ pub fn preset(level: u32) -> Config {
 }
 
 /// Detect and strip wasted (common trailing-zero) bits, mutating `signal` in
-/// place and returning the shift (`get_wasted_bits_`, `stream_encoder.c:4469`).
-/// All-zero signal -> shift 0 (silence keeps its full bps).
-pub(crate) fn get_wasted_bits(signal: &mut [i32]) -> u32 {
-    let mut x = 0i32;
+/// place and returning the shift (`get_wasted_bits_` / `get_wasted_bits_wide_`,
+/// `stream_encoder.c:4469`/`4493`). `wide` selects the 33-bit-side variant, used
+/// only for the side channel of 32-bit stereo: it differs solely in the all-zero
+/// case, returning shift **1** (so a 33-bit side always fits `i32` after the
+/// shift) where the narrow version returns 0.
+pub(crate) fn get_wasted_bits(signal: &mut [i64], wide: bool) -> u32 {
+    let mut x = 0i64;
     let mut i = 0;
     while i < signal.len() && x & 1 == 0 {
         x |= signal[i];
         i += 1;
     }
-    let shift = if x == 0 { 0 } else { x.trailing_zeros() };
+    let shift = if x == 0 {
+        u32::from(wide)
+    } else {
+        x.trailing_zeros()
+    };
     if shift > 0 {
         for s in signal.iter_mut() {
             *s >>= shift;
@@ -178,7 +186,7 @@ enum Choice {
 /// A channel's chosen subframe plus everything needed to write it once the
 /// channel assignment is decided.
 struct ChosenChannel {
-    signal: Vec<i32>,
+    signal: Vec<i64>,
     subframe_bps: u32,
     wasted_bits: u32,
     choice: Choice,
@@ -217,7 +225,7 @@ fn set_next_subdivide_tukey(parts: i32, a: &mut u32, depth: &mut u32, part: &mut
 /// or returns `None` to skip this sub-window (tiny block, or a constant signal).
 #[allow(clippy::too_many_arguments)]
 fn apply_apodization(
-    signal: &[i32],
+    signal: &[i64],
     window: &[f32],
     windowed: &mut [f32],
     autoc: &mut [f64],
@@ -285,7 +293,7 @@ fn apply_apodization(
 /// meaning "can't LPC at this order").
 #[allow(clippy::too_many_arguments)]
 fn evaluate_lpc_subframe(
-    signal: &[i32],
+    signal: &[i64],
     subframe_bps: u32,
     wasted_bits: u32,
     lp_coeff_row: &[f32],
@@ -340,7 +348,7 @@ fn evaluate_lpc_subframe(
 /// lowest-bit candidate, or `None` if none could be produced.
 #[allow(clippy::too_many_arguments)]
 fn best_lpc_subframe(
-    signal: &[i32],
+    signal: &[i64],
     subframe_bps: u32,
     wasted_bits: u32,
     blocksize: u32,
@@ -416,7 +424,7 @@ fn best_lpc_subframe(
 /// mid-side channel decision can pick among already-evaluated subframes.
 #[allow(clippy::too_many_arguments)]
 fn choose_subframe(
-    signal: &[i32],
+    signal: &[i64],
     subframe_bps: u32,
     wasted_bits: u32,
     blocksize: u32,
@@ -430,30 +438,39 @@ fn choose_subframe(
     let mut best = Choice::Verbatim;
 
     if bs > MAX_FIXED_ORDER {
-        if signal.iter().all(|&s| s == signal[0]) {
+        // libFLAC's constant detection keys off `fixed_residual_bits_per_sample[1]
+        // == 0.0`, which the guess predictor only produces below 28 bps; at
+        // `subframe_bps >= 28` the `_limit_residual` predictor reports 34.0 even for
+        // a constant signal, so CONSTANT is never selected there (it becomes FIXED).
+        if subframe_bps < 28 && signal.iter().all(|&s| s == signal[0]) {
             let cb = subframe::constant_bits(subframe_bps, wasted_bits);
             if cb < best_bits {
                 best_bits = cb;
                 best = Choice::Constant;
             }
         } else {
-            let order = fixed::compute_best_predictor_order(signal);
-            let residual = fixed::compute_residual(signal, order);
-            let (rice_part, residual_bits) = rice::find_best_partition_order(
-                &residual,
-                order,
-                rice_parameter_limit,
-                min_partition_order,
-                max_partition_order,
-            );
-            let fb = subframe::fixed_bits(order, subframe_bps, wasted_bits, residual_bits);
-            if fb < best_bits {
-                best_bits = fb;
-                best = Choice::Fixed {
+            let (order, fixed_rbps) = fixed::compute_best_predictor_order(signal, subframe_bps);
+            // libFLAC skips a fixed order whose estimated bits/sample already meets
+            // or exceeds the subframe bps (`process_subframe_`, stream_encoder.c:3561)
+            // — e.g. an incompressible/overflowing wide signal — leaving VERBATIM.
+            if (fixed_rbps) < subframe_bps as f32 {
+                let residual = fixed::compute_residual(signal, order);
+                let (rice_part, residual_bits) = rice::find_best_partition_order(
+                    &residual,
                     order,
-                    residual,
-                    rice: rice_part,
-                };
+                    rice_parameter_limit,
+                    min_partition_order,
+                    max_partition_order,
+                );
+                let fb = subframe::fixed_bits(order, subframe_bps, wasted_bits, residual_bits);
+                if fb < best_bits {
+                    best_bits = fb;
+                    best = Choice::Fixed {
+                        order,
+                        residual,
+                        rice: rice_part,
+                    };
+                }
             }
 
             if let Some(ctx) = lpc_ctx {
@@ -484,14 +501,12 @@ fn choose_subframe(
 fn write_choice(
     bw: &mut BitWriter,
     choice: &Choice,
-    signal: &[i32],
+    signal: &[i64],
     subframe_bps: u32,
     wasted_bits: u32,
 ) {
     match choice {
-        Choice::Constant => {
-            subframe::write_constant(bw, signal[0] as i64, subframe_bps, wasted_bits)
-        }
+        Choice::Constant => subframe::write_constant(bw, signal[0], subframe_bps, wasted_bits),
         Choice::Verbatim => subframe::write_verbatim(bw, signal, subframe_bps, wasted_bits),
         Choice::Fixed {
             order,
@@ -608,9 +623,12 @@ fn encode_frames_inner(
 
         // Wasted-bits-shift a channel signal, then choose its best subframe.
         // `extra_bps` is 1 for the side channel (its values span one extra bit).
-        let choose = |signal: Vec<i32>, extra_bps: u32| -> ChosenChannel {
+        let choose = |signal: Vec<i64>, extra_bps: u32| -> ChosenChannel {
             let mut sig = signal;
-            let mut wasted = get_wasted_bits(&mut sig);
+            // The 33-bit-side wasted-bits variant is used only for the side channel
+            // (`extra_bps == 1`) of a 32-bit stream (`get_wasted_bits_wide_`).
+            let wide = extra_bps == 1 && bits_per_sample == 32;
+            let mut wasted = get_wasted_bits(&mut sig, wide);
             if wasted > bits_per_sample {
                 wasted = bits_per_sample;
             }
@@ -637,13 +655,19 @@ fn encode_frames_inner(
         let mut frame = BitWriter::new();
 
         if stereo_ms {
-            let left: Vec<i32> = (0..bs).map(|i| interleaved[(start + i) * ch]).collect();
-            let right: Vec<i32> = (0..bs).map(|i| interleaved[(start + i) * ch + 1]).collect();
+            let left: Vec<i64> = (0..bs)
+                .map(|i| interleaved[(start + i) * ch] as i64)
+                .collect();
+            let right: Vec<i64> = (0..bs)
+                .map(|i| interleaved[(start + i) * ch + 1] as i64)
+                .collect();
             // Mid/side from the *original* (pre-wasted-shift) L/R
-            // (`process_subframes_:3210`): side = L - R, mid = (L + R) >> 1.
+            // (`process_subframes_:3210`): side = L - R, mid = (L + R) >> 1. The i64
+            // arithmetic is exact for the 33-bit side / 32-bit mid of 32-bit input
+            // and matches the i32 path for ≤24-bit.
             let mid_side = || {
-                let mid: Vec<i32> = (0..bs).map(|i| (left[i] + right[i]) >> 1).collect();
-                let side: Vec<i32> = (0..bs).map(|i| left[i] - right[i]).collect();
+                let mid: Vec<i64> = (0..bs).map(|i| (left[i] + right[i]) >> 1).collect();
+                let side: Vec<i64> = (0..bs).map(|i| left[i] - right[i]).collect();
                 (mid, side)
             };
 
@@ -734,7 +758,9 @@ fn encode_frames_inner(
                 },
             );
             for c in 0..ch {
-                let signal: Vec<i32> = (0..bs).map(|i| interleaved[(start + i) * ch + c]).collect();
+                let signal: Vec<i64> = (0..bs)
+                    .map(|i| interleaved[(start + i) * ch + c] as i64)
+                    .collect();
                 let cc = choose(signal, 0);
                 write_choice(
                     &mut frame,

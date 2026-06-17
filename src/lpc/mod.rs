@@ -25,10 +25,13 @@ pub use quantize::Quantized;
 /// the predictor history are sized to this.
 pub const MAX_LPC_ORDER: usize = 32;
 
-/// Apply a window to integer signal data (`FLAC__lpc_window_data`, `lpc.c:68`):
-/// `out[i] = in[i] * window[i]`, the integer promoted to `f32` and multiplied in
-/// `f32`. `in`/`window`/`out` are all at least `data_len` long.
-pub fn window_data(input: &[i32], window: &[f32], out: &mut [f32], data_len: usize) {
+/// Apply a window to integer signal data (`FLAC__lpc_window_data[_wide]`,
+/// `lpc.c:68`): `out[i] = in[i] * window[i]`, the integer promoted to `f32` and
+/// multiplied in `f32`. `in` is `i64` (the unified channel type — the 33-bit side
+/// loses precision in the `f32` cast exactly as the C's `_wide` variant does; for
+/// ≤24-bit values the cast is identical to the narrow path). `in`/`window`/`out`
+/// are all at least `data_len` long.
+pub fn window_data(input: &[i64], window: &[f32], out: &mut [f32], data_len: usize) {
     for i in 0..data_len {
         out[i] = input[i] as f32 * window[i];
     }
@@ -41,7 +44,7 @@ pub fn window_data(input: &[i32], window: &[f32], out: &mut [f32], data_len: usi
 /// trailing zero; only `out[0..2*part_size)` is subsequently read by the
 /// autocorrelation, but the exact indexing is preserved.
 pub fn window_data_partial(
-    input: &[i32],
+    input: &[i64],
     window: &[f32],
     out: &mut [f32],
     data_len: usize,

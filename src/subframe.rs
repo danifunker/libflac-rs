@@ -23,10 +23,11 @@ pub fn write_constant(bw: &mut BitWriter, value: i64, subframe_bps: u32, wasted_
 }
 
 /// VERBATIM subframe: every sample stored raw (`FLAC__subframe_add_verbatim`).
-pub fn write_verbatim(bw: &mut BitWriter, signal: &[i32], subframe_bps: u32, wasted_bits: u32) {
+/// `signal` is `i64` (the unified channel type; up to 33 bps for the side channel).
+pub fn write_verbatim(bw: &mut BitWriter, signal: &[i64], subframe_bps: u32, wasted_bits: u32) {
     write_subframe_header(bw, SUBFRAME_TYPE_VERBATIM_BYTE_ALIGNED_MASK, wasted_bits);
     for &s in signal {
-        bw.write_raw_i32(s, subframe_bps);
+        bw.write_raw_i64(s, subframe_bps);
     }
 }
 
@@ -47,7 +48,7 @@ pub fn verbatim_bits(blocksize: u32, subframe_bps: u32, wasted_bits: u32) -> u32
 pub fn write_fixed(
     bw: &mut BitWriter,
     order: u32,
-    warmup: &[i32],
+    warmup: &[i64],
     subframe_bps: u32,
     wasted_bits: u32,
     residual: &[i32],
@@ -59,7 +60,7 @@ pub fn write_fixed(
         wasted_bits,
     );
     for &w in warmup {
-        bw.write_raw_i64(w as i64, subframe_bps);
+        bw.write_raw_i64(w, subframe_bps);
     }
     write_entropy_and_residual(bw, residual, order, rice);
 }
@@ -83,7 +84,7 @@ pub fn fixed_bits(order: u32, subframe_bps: u32, wasted_bits: u32, residual_bits
 pub fn write_lpc(
     bw: &mut BitWriter,
     order: u32,
-    warmup: &[i32],
+    warmup: &[i64],
     qlp_coeff: &[i32],
     precision: u32,
     shift: i32,
@@ -98,7 +99,7 @@ pub fn write_lpc(
         wasted_bits,
     );
     for &w in warmup {
-        bw.write_raw_i64(w as i64, subframe_bps);
+        bw.write_raw_i64(w, subframe_bps);
     }
     bw.write_raw_u32(precision - 1, SUBFRAME_LPC_QLP_COEFF_PRECISION_LEN);
     bw.write_raw_i32(shift, SUBFRAME_LPC_QLP_SHIFT_LEN);
