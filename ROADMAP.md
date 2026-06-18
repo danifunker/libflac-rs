@@ -22,8 +22,8 @@ DONE   Phase 4  Compression levels 0–8               ████████�
 DONE   Phase 5  Metadata + MD5 (full streams)        █████████
 DONE   Phase 6  Bit depths 8/12/16/20/24 (RICE2)     █████████
 DONE   Phase 7  32-bit / wide-residual paths         █████████
-WIP    Phase 8  Metadata: framework + APPLICATION +   █████░░░░
-                 PICTURE done; SEEKTABLE/CUESHEET left
+WIP    Phase 8  Metadata: APPLICATION + PICTURE +     ███████░░
+                 SEEKTABLE done; CUESHEET left
 DONE*  Phase 9  The decoder (core: round-trips +      ████████░
                  reads real libFLAC; polish left)
 TODO   Phase 10 Ogg FLAC (optional)                  ░░░░░░░░░
@@ -180,15 +180,26 @@ identical/anti/scaled L−R cases that force each channel assignment at 32-bit.
 
 # WIP — Phase 8: full metadata blocks + user metadata API
 
-**Status: framework + APPLICATION + PICTURE done.** `metadata::MetadataBlock`
-(VorbisComment / Padding / Application / Picture) is the user-metadata API;
-`encode()` takes an ordered `&[MetadataBlock]` after STREAMINFO. APPLICATION and
-PICTURE serialize **byte-identically to libFLAC** (verified via manually-filled C
-metadata structs in the shim — which also revealed libFLAC auto-prepends its
-default VORBIS_COMMENT to any user metadata) and round-trip through the decoder.
-**Remaining: SEEKTABLE** (needs generation — spaced points + per-frame offset fill
-during encode, coupled to `encode_frames_inner`) and **CUESHEET** (niche; a
-nested track/index structure). The plan below covers those.
+**Status: framework + APPLICATION + PICTURE + SEEKTABLE done.**
+`metadata::MetadataBlock` (VorbisComment / Padding / Application / Picture /
+Seektable) is the user-metadata API; `encode()` takes an ordered `&[MetadataBlock]`
+after STREAMINFO. APPLICATION, PICTURE, and SEEKTABLE serialize **byte-identically
+to libFLAC** (verified via manually-filled C metadata structs in the shim — which
+also revealed libFLAC auto-prepends its default VORBIS_COMMENT to any user
+metadata) and round-trip through the decoder. SEEKTABLE is *generated* during
+encoding: a template of target sample numbers (build evenly-spaced ones with
+`metadata::spaced_seek_points`) is filled per-frame in `encode_frames_inner`
+(`fill_seekpoints`) then sorted/uniquified at finish (`metadata::seektable_sort`).
+The decoder parses SEEKTABLE into `DecodedStream::seek_points` (groundwork for
+Phase 9 `seek()`). **Remaining: CUESHEET** (niche; a nested track/index structure).
+The plan below covers it.
+
+**Key finding (SEEKTABLE fill):** libFLAC fills each point from
+`FLAC__stream_encoder_get_blocksize()`, which `finish` lowers to the *actual*
+sample count for the short final frame (`stream_encoder.c:1493`). So the match
+range and the stored `frame_samples` use the current frame's real length, not the
+configured block size — a point landing in the short final frame records that
+shorter count.
 
 **Goal:** emit every standard metadata block and let callers supply them, in
 libFLAC's canonical order (STREAMINFO first, user blocks next, PADDING last, with
@@ -206,10 +217,10 @@ decoder's per-type readers (`stream_decoder.c:1404-1491`) document each layout.
 
 ### Block bodies to add (type code → layout)
 
-- **SEEKTABLE (3):** N × 18-byte seekpoints, each = `sample_number: u64` ·
+- **SEEKTABLE (3): DONE.** N × 18-byte seekpoints, each = `sample_number: u64` ·
   `stream_offset: u64` (from first audio frame) · `frame_samples: u16`. A
-  placeholder point is `sample_number = 0xFFFFFFFFFFFFFFFF`. Build the real table
-  during/after encoding (needs each frame's sample number + byte offset).
+  placeholder point is `sample_number = 0xFFFFFFFFFFFFFFFF`. Built during encoding
+  (`fill_seekpoints` + `seektable_sort`), byte-exact vs libFLAC.
 - **APPLICATION (2):** `id: [u8;4]` · application data (rest of `length`).
 - **CUESHEET (5):** `media_catalog_number: [u8;128]` · `lead_in: u64` ·
   `is_cd: 1 bit` · `258 reserved bits (0)` · `num_tracks: u8` · then per track:

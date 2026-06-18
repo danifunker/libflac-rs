@@ -95,6 +95,21 @@ unsafe extern "C" {
         out: *mut u8,
         out_len: *mut usize,
     ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    fn libflac_rs_cref_encode_full_seektable(
+        interleaved: *const i32,
+        nsamples: u32,
+        channels: u32,
+        bps: u32,
+        sample_rate: u32,
+        blocksize: u32,
+        compression_level: i32,
+        do_md5: i32,
+        sample_numbers: *const u64,
+        num_points: u32,
+        out: *mut u8,
+        out_len: *mut usize,
+    ) -> c_int;
     fn libflac_rs_cref_vendor_string(out: *mut u8, cap: usize) -> usize;
     fn libflac_rs_cref_crc8(data: *const u8, len: u32) -> u8;
     fn libflac_rs_cref_crc16(data: *const u8, len: u32) -> u16;
@@ -256,6 +271,41 @@ fn c_encode_full(
         )
     };
     assert_eq!(rc, 0, "C encode_full returned {rc}");
+    out.truncate(out_len);
+    out
+}
+
+/// Encode a complete FLAC stream with a SEEKTABLE (the given target sample numbers)
+/// via the C reference; libFLAC generates/fills/sorts it during encoding.
+fn c_encode_full_seektable(
+    interleaved: &[i32],
+    channels: u32,
+    bps: u32,
+    blocksize: u32,
+    level: i32,
+    do_md5: bool,
+    sample_numbers: &[u64],
+) -> Vec<u8> {
+    let nsamples = (interleaved.len() / channels as usize) as u32;
+    let mut out = vec![0u8; interleaved.len() * 4 + 8192];
+    let mut out_len = out.len();
+    let rc = unsafe {
+        libflac_rs_cref_encode_full_seektable(
+            interleaved.as_ptr(),
+            nsamples,
+            channels,
+            bps,
+            44_100,
+            blocksize,
+            level,
+            do_md5 as i32,
+            sample_numbers.as_ptr(),
+            sample_numbers.len() as u32,
+            out.as_mut_ptr(),
+            &mut out_len,
+        )
+    };
+    assert_eq!(rc, 0, "C encode_full_seektable returned {rc}");
     out.truncate(out_len);
     out
 }
@@ -1421,6 +1471,104 @@ fn picture_metadata_matches_c() {
     assert_eq!(rust, out, "PICTURE stream differs from C");
     let dec = libflac_rs::testing::decode(&rust).expect("decode");
     assert_eq!(dec.interleaved, pcm, "PICTURE round-trip");
+}
+
+/// Target sample numbers for `num` evenly-spaced seek points (the formula in
+/// `metadata::spaced_seek_points` / libFLAC's `append_spaced_points`), used to drive
+/// both the Rust template and the C shim identically.
+fn spaced_targets(num: u32, total: u64) -> Vec<u64> {
+    libflac_rs::testing::spaced_seek_points(num, total)
+        .iter()
+        .map(|p| p.sample_number)
+        .collect()
+}
+
+/// Phase 8: a SEEKTABLE block. Unlike APPLICATION/PICTURE (which the caller fully
+/// supplies), libFLAC *generates* the seektable during encoding: each placeholder
+/// point is filled with the frame holding its target sample (rewriting the sample to
+/// the frame's first sample, recording the frame's byte offset and the *configured*
+/// blocksize), then the table is sorted + uniquified at finish — collapsing multiple
+/// targets that land in one frame and padding the freed tail with placeholders. The
+/// Rust encoder must reproduce the filled+sorted table and the whole stream byte-for-
+/// byte. As with the other metadata blocks, libFLAC prepends its default
+/// VORBIS_COMMENT, so the block list starts with it.
+#[test]
+fn seektable_metadata_matches_c() {
+    let vendor = libflac_rs::testing::LIBFLAC_VENDOR_STRING;
+    let bs = 2048u32;
+    let n_sparse = bs as usize * 4 + 500; // ~5 frames
+    let n_dense = bs as usize * 2 + 700; // ~3 frames
+    let n_explicit = bs as usize * 3 + 100; // ~4 frames (short final)
+    let n_unclaimed = bs as usize * 2 + 10; // ~3 frames
+    // Cases exercising: one point per frame (no dedup); many targets per frame
+    // (heavy dedup -> trailing placeholders); explicit targets on/near frame
+    // boundaries; a target past the end (never claimed -> kept as written); and a
+    // single point.
+    let cases: &[(usize, Vec<u64>)] = &[
+        (n_sparse, spaced_targets(4, n_sparse as u64)),
+        (n_dense, spaced_targets(32, n_dense as u64)),
+        (
+            n_explicit,
+            vec![
+                0,
+                bs as u64,
+                bs as u64 + 5,
+                bs as u64 * 2,
+                bs as u64 * 3 + 50,
+            ],
+        ),
+        (n_unclaimed, vec![0, bs as u64, bs as u64 * 5]),
+        (bs as usize + 10, vec![0]),
+    ];
+    for (n, targets) in cases {
+        for &bps in &[16u32, 24] {
+            for level in [0u32, 8] {
+                let pcm = gen_pcm_bps(7, *n, bps);
+                let template: Vec<libflac_rs::testing::SeekPoint> = targets
+                    .iter()
+                    .map(|&s| libflac_rs::testing::SeekPoint {
+                        sample_number: s,
+                        stream_offset: 0,
+                        frame_samples: 0,
+                    })
+                    .collect();
+                let rust = libflac_rs::testing::encode(
+                    &pcm,
+                    2,
+                    bps,
+                    44_100,
+                    bs,
+                    &libflac_rs::testing::preset(level),
+                    true,
+                    &[
+                        MetadataBlock::VorbisComment(vendor),
+                        MetadataBlock::Seektable(&template),
+                    ],
+                );
+                let c = c_encode_full_seektable(&pcm, 2, bps, bs, level as i32, true, targets);
+                assert_eq!(
+                    rust,
+                    c,
+                    "[bps {bps} level {level} npts {} n {n}] SEEKTABLE stream differs",
+                    targets.len()
+                );
+                // Round-trips, and our decoder recovers the (preserved) point count
+                // in sorted order with placeholders last.
+                let dec = libflac_rs::testing::decode(&rust).expect("decode");
+                assert_eq!(dec.interleaved, pcm, "SEEKTABLE round-trip PCM");
+                assert_eq!(
+                    dec.seek_points.len(),
+                    targets.len(),
+                    "decoded seek point count"
+                );
+                let mut prev = 0u64;
+                for p in &dec.seek_points {
+                    assert!(p.sample_number >= prev, "decoded seek points sorted");
+                    prev = p.sample_number;
+                }
+            }
+        }
+    }
 }
 
 /// The decoder against **real libFLAC output**: decode complete streams the C

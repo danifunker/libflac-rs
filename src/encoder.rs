@@ -536,6 +536,43 @@ fn write_choice(
     }
 }
 
+/// Mark every seek point whose target sample falls in the frame starting at
+/// `frame_first_sample` (`write_frame_`, `stream_encoder.c:2741`). The match range
+/// and the recorded `frame_samples` use this frame's *actual* sample count
+/// (`blocksize`): libFLAC reads `get_blocksize()`, which equals the configured block
+/// size for every frame except the short final one, where `finish` lowers it to the
+/// remaining sample count (`stream_encoder.c:1493`). `stream_offset` is the frame's
+/// byte offset from the first audio frame. `first` is the persistent
+/// `first_seekpoint_to_check` cursor; points are visited in (sorted) target order,
+/// and a claimed point's `sample_number` is rewritten to the frame's first sample,
+/// so several targets landing in one frame become duplicates (deduped at finish by
+/// [`metadata::seektable_sort`]).
+fn fill_seekpoints(
+    points: &mut [metadata::SeekPoint],
+    first: &mut usize,
+    frame_first_sample: u64,
+    blocksize: u64,
+    stream_offset: u64,
+) {
+    let frame_last_sample = frame_first_sample + blocksize - 1;
+    while *first < points.len() {
+        let test = points[*first].sample_number;
+        if test > frame_last_sample {
+            break; // belongs to a later frame; resume here next time
+        }
+        if test >= frame_first_sample {
+            points[*first] = metadata::SeekPoint {
+                sample_number: frame_first_sample,
+                stream_offset,
+                frame_samples: blocksize as u32,
+            };
+        }
+        // Either claimed (set above) or already passed (test < frame_first_sample);
+        // advance the cursor in both cases, as the C does.
+        *first += 1;
+    }
+}
+
 /// Encode interleaved integer PCM into FLAC audio frames (no metadata) with the
 /// given compression `config`. For stereo with `do_mid_side`, each frame picks the
 /// channel assignment with the fewest bits (or, with `loose_mid_side`, re-decides
@@ -556,12 +593,16 @@ pub fn encode_frames(
         sample_rate,
         blocksize,
         config,
+        None,
     )
     .0
 }
 
 /// As [`encode_frames`], also returning the min/max frame size in bytes (for
-/// STREAMINFO). `min_framesize` is 0 if no frames were produced.
+/// STREAMINFO). `min_framesize` is 0 if no frames were produced. When `seektable`
+/// is `Some`, it is a SEEKTABLE *template* (sorted target sample numbers) filled in
+/// place as frames go by, then sorted/uniquified at finish — exactly as libFLAC
+/// generates a seektable during encoding.
 fn encode_frames_inner(
     interleaved: &[i32],
     channels: u32,
@@ -569,6 +610,7 @@ fn encode_frames_inner(
     sample_rate: u32,
     blocksize: u32,
     config: &Config,
+    mut seektable: Option<&mut [metadata::SeekPoint]>,
 ) -> (Vec<u8>, u32, u32) {
     let ch = channels as usize;
     assert!(ch > 0 && interleaved.len() % ch == 0, "ragged interleave");
@@ -597,9 +639,24 @@ fn encode_frames_inner(
     let mut min_framesize = u32::MAX;
     let mut max_framesize = 0u32;
     let mut frame_number = 0u32;
+    // Persistent SEEKTABLE cursor (`first_seekpoint_to_check`): the index of the
+    // first not-yet-resolved seek point, only ever advanced.
+    let mut first_seekpoint_to_check = 0usize;
     let mut start = 0usize;
     while start < total {
         let bs = (total - start).min(blocksize as usize);
+        // Byte offset of this frame from the first audio frame (= bytes already
+        // emitted, since `out` holds only frames here) — the seek-point offset.
+        let stream_offset = out.len() as u64;
+        if let Some(points) = seektable.as_deref_mut() {
+            fill_seekpoints(
+                points,
+                &mut first_seekpoint_to_check,
+                start as u64,
+                bs as u64,
+                stream_offset,
+            );
+        }
 
         // Per-frame Rice partition-order bounds (`process_subframes_:3163`). The
         // C clamps min to max (`flac_min`); min is 0 so that is a no-op, and
@@ -784,6 +841,11 @@ fn encode_frames_inner(
     if min_framesize == u32::MAX {
         min_framesize = 0;
     }
+    // Finish: sort + uniquify the filled seektable, padding the tail with
+    // placeholders (`stream_encoder.c:2918`).
+    if let Some(points) = seektable {
+        metadata::seektable_sort(points);
+    }
     (out, min_framesize, max_framesize)
 }
 
@@ -809,6 +871,17 @@ pub fn encode(
     assert!(ch > 0 && interleaved.len() % ch == 0, "ragged interleave");
     let total_samples = (interleaved.len() / ch) as u64;
 
+    // libFLAC fills the (first) SEEKTABLE during encoding, then rewrites it; we
+    // clone the template, fill it as frames are produced, and serialize the filled
+    // copy below in place of the original block.
+    let mut filled_seektable: Option<Vec<metadata::SeekPoint>> = blocks.iter().find_map(|b| {
+        if let metadata::MetadataBlock::Seektable(pts) = b {
+            Some(pts.to_vec())
+        } else {
+            None
+        }
+    });
+
     let (frames, min_framesize, max_framesize) = encode_frames_inner(
         interleaved,
         channels,
@@ -816,6 +889,7 @@ pub fn encode(
         sample_rate,
         blocksize,
         config,
+        filled_seektable.as_deref_mut(),
     );
 
     let md5 = if do_md5 {
@@ -840,7 +914,16 @@ pub fn encode(
     bw.write_byte_block(b"fLaC");
     metadata::write_streaminfo(&mut bw, &si, blocks.is_empty());
     for (i, block) in blocks.iter().enumerate() {
-        metadata::write_block(&mut bw, block, i + 1 == blocks.len());
+        let is_last = i + 1 == blocks.len();
+        match block {
+            // Substitute the filled+sorted seek points for the supplied template.
+            metadata::MetadataBlock::Seektable(_) => metadata::write_seektable(
+                &mut bw,
+                filled_seektable.as_deref().unwrap_or(&[]),
+                is_last,
+            ),
+            _ => metadata::write_block(&mut bw, block, is_last),
+        }
     }
     let mut out = bw.as_bytes().to_vec();
     out.extend_from_slice(&frames);

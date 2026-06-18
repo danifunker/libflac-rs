@@ -11,6 +11,7 @@
 use crate::bitreader::BitReader;
 use crate::crc::{crc8, crc16};
 use crate::frame::ChannelAssignment;
+use crate::metadata::SeekPoint;
 
 /// Decoded audio frames.
 pub struct DecodedFrames {
@@ -63,6 +64,9 @@ pub struct DecodedStream {
     /// Whether the decoded audio's MD5 matches STREAMINFO (trivially `true` when
     /// STREAMINFO carries no MD5).
     pub md5_ok: bool,
+    /// The seek points from the SEEKTABLE block, if any (empty otherwise). Trailing
+    /// placeholder points (sample number `0xFFFF…`) are retained as stored.
+    pub seek_points: Vec<SeekPoint>,
 }
 
 /// Decode a complete FLAC stream: the `fLaC` marker, the metadata blocks (only
@@ -76,6 +80,7 @@ pub fn decode(data: &[u8]) -> Option<DecodedStream> {
     }
 
     let mut info: Option<StreamInfo> = None;
+    let mut seek_points: Vec<SeekPoint> = Vec::new();
     loop {
         let is_last = br.read_raw_u32(1)? == 1;
         let block_type = br.read_raw_u32(7)?;
@@ -101,6 +106,22 @@ pub fn decode(data: &[u8]) -> Option<DecodedStream> {
                 total_samples,
                 md5,
             });
+        } else if block_type == 3 {
+            // SEEKTABLE: length / 18 points of (sample u64, offset u64, samples u16).
+            let n = length / 18;
+            seek_points = Vec::with_capacity(n);
+            for _ in 0..n {
+                let sample_number = br.read_raw_u64(64)?;
+                let stream_offset = br.read_raw_u64(64)?;
+                let frame_samples = br.read_raw_u32(16)?;
+                seek_points.push(SeekPoint {
+                    sample_number,
+                    stream_offset,
+                    frame_samples,
+                });
+            }
+            // Tolerate a length not divisible by 18 (non-conforming writers).
+            br.skip_bytes(length - n * 18)?;
         } else {
             br.skip_bytes(length)?;
         }
@@ -138,6 +159,7 @@ pub fn decode(data: &[u8]) -> Option<DecodedStream> {
         total_samples: info.total_samples,
         md5: info.md5,
         md5_ok,
+        seek_points,
     })
 }
 

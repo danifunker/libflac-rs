@@ -25,10 +25,28 @@ pub struct StreamInfo {
 const METADATA_TYPE_STREAMINFO: u32 = 0;
 const METADATA_TYPE_PADDING: u32 = 1;
 const METADATA_TYPE_APPLICATION: u32 = 2;
+const METADATA_TYPE_SEEKTABLE: u32 = 3;
 const METADATA_TYPE_VORBIS_COMMENT: u32 = 4;
 const METADATA_TYPE_PICTURE: u32 = 6;
 /// STREAMINFO body length in bytes.
 const STREAMINFO_LENGTH: u32 = 34;
+/// One serialized seek point: `sample_number` (u64) + `stream_offset` (u64) +
+/// `frame_samples` (u16) = 18 bytes (`FLAC__STREAM_METADATA_SEEKPOINT_LENGTH`).
+const SEEKPOINT_LENGTH: u32 = 18;
+/// Sample number marking an unused seek point
+/// (`FLAC__STREAM_METADATA_SEEKPOINT_PLACEHOLDER`, `format.c:81`).
+pub const SEEKPOINT_PLACEHOLDER: u64 = 0xffff_ffff_ffff_ffff;
+
+/// One SEEKTABLE seek point (`FLAC__StreamMetadata_SeekPoint`). In a *template*
+/// (before encoding) `sample_number` is the target sample to make seekable and the
+/// other two fields are 0; the encoder rewrites all three for the frame that holds
+/// each target (see [`crate::encoder`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeekPoint {
+    pub sample_number: u64,
+    pub stream_offset: u64,
+    pub frame_samples: u32,
+}
 
 /// A metadata block the caller can place after STREAMINFO (which the encoder
 /// always writes first). libFLAC writes blocks in the order given (the OGG
@@ -40,6 +58,11 @@ pub enum MetadataBlock<'a> {
     Padding(u32),
     /// An APPLICATION block: a 4-byte registered application id + opaque data.
     Application { id: [u8; 4], data: &'a [u8] },
+    /// A SEEKTABLE block: the seek points to serialize, in order. The encoder fills
+    /// a *template* (each point's `sample_number` a target, offsets 0) during
+    /// encoding and writes the filled+sorted result; [`write_seektable`] serializes
+    /// whatever points it is given verbatim.
+    Seektable(&'a [SeekPoint]),
     /// A PICTURE block (e.g. cover art). `mime_type`/`description` are stored with
     /// 32-bit length prefixes; `picture_type` is the FLAC picture-type code.
     Picture {
@@ -60,6 +83,7 @@ pub fn write_block(bw: &mut BitWriter, block: &MetadataBlock, is_last: bool) {
         MetadataBlock::VorbisComment(vendor) => write_vorbis_comment(bw, vendor, is_last),
         MetadataBlock::Padding(len) => write_padding(bw, *len, is_last),
         MetadataBlock::Application { id, data } => write_application(bw, id, data, is_last),
+        MetadataBlock::Seektable(points) => write_seektable(bw, points, is_last),
         MetadataBlock::Picture {
             picture_type,
             mime_type,
@@ -101,6 +125,79 @@ pub fn write_application(bw: &mut BitWriter, id: &[u8; 4], data: &[u8], is_last:
     );
     bw.write_byte_block(id);
     bw.write_byte_block(data);
+}
+
+/// Write a SEEKTABLE block: N seek points × 18 bytes
+/// (`stream_encoder_framing.c:122`; the finish-time rewrite at
+/// `stream_encoder.c:2928` produces the same layout). `sample_number` and
+/// `stream_offset` are 64-bit, `frame_samples` 16-bit, all big-endian. The body
+/// length is `num_points * 18` even after sorting (unused trailing points are
+/// placeholders), matching the header written once at metadata time.
+pub fn write_seektable(bw: &mut BitWriter, points: &[SeekPoint], is_last: bool) {
+    write_block_header(
+        bw,
+        is_last,
+        METADATA_TYPE_SEEKTABLE,
+        points.len() as u32 * SEEKPOINT_LENGTH,
+    );
+    for p in points {
+        bw.write_raw_u64(p.sample_number, 64);
+        bw.write_raw_u64(p.stream_offset, 64);
+        bw.write_raw_u32(p.frame_samples, 16);
+    }
+}
+
+/// Build a SEEKTABLE *template* of `num` evenly-spaced placeholder points for a
+/// stream of `total_samples`
+/// (`FLAC__metadata_object_seektable_template_append_spaced_points`): point `i`
+/// targets sample `total_samples * i / num`, with zero offset/frame_samples, to be
+/// filled during encoding. Returns empty if `num` or `total_samples` is 0. (For a
+/// legal table — at most ~932k points so the block fits the 24-bit length field —
+/// the `total_samples * i` product cannot overflow `u64`.)
+pub fn spaced_seek_points(num: u32, total_samples: u64) -> Vec<SeekPoint> {
+    if num == 0 || total_samples == 0 {
+        return Vec::new();
+    }
+    (0..num as u64)
+        .map(|i| SeekPoint {
+            sample_number: total_samples * i / num as u64,
+            stream_offset: 0,
+            frame_samples: 0,
+        })
+        .collect()
+}
+
+/// Sort + uniquify a (filled) seektable in place, exactly as the encoder does at
+/// finish (`FLAC__format_seektable_sort`, `format.c:281`): sort by `sample_number`
+/// (placeholders, `u64::MAX`, sort last), drop any non-placeholder point whose
+/// `sample_number` duplicates the previous kept point, and overwrite the freed tail
+/// slots with placeholders. The point count is preserved, so the serialized length
+/// is unchanged.
+pub fn seektable_sort(points: &mut [SeekPoint]) {
+    if points.is_empty() {
+        return;
+    }
+    // qsort in C is unstable, but post-fill duplicates share all three fields, so
+    // the kept representative is identical regardless of order.
+    points.sort_by_key(|p| p.sample_number);
+    let mut j = 0usize;
+    let mut first = true;
+    for i in 0..points.len() {
+        let sn = points[i].sample_number;
+        if !first && sn != SEEKPOINT_PLACEHOLDER && sn == points[j - 1].sample_number {
+            continue; // duplicate of the previous kept point
+        }
+        first = false;
+        points[j] = points[i];
+        j += 1;
+    }
+    for p in &mut points[j..] {
+        *p = SeekPoint {
+            sample_number: SEEKPOINT_PLACEHOLDER,
+            stream_offset: 0,
+            frame_samples: 0,
+        };
+    }
 }
 
 /// The vendor string libFLAC 1.4.3 writes into its auto VORBIS_COMMENT
@@ -149,4 +246,87 @@ pub fn write_vorbis_comment(bw: &mut BitWriter, vendor: &str, is_last: bool) {
 pub fn write_padding(bw: &mut BitWriter, length: u32, is_last: bool) {
     write_block_header(bw, is_last, METADATA_TYPE_PADDING, length);
     bw.write_zeroes(length * 8);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pt(sample_number: u64, stream_offset: u64, frame_samples: u32) -> SeekPoint {
+        SeekPoint {
+            sample_number,
+            stream_offset,
+            frame_samples,
+        }
+    }
+
+    fn placeholder() -> SeekPoint {
+        pt(SEEKPOINT_PLACEHOLDER, 0, 0)
+    }
+
+    #[test]
+    fn spaced_points_formula() {
+        // sample_number = total * i / num (matches libFLAC's append_spaced_points).
+        assert_eq!(
+            spaced_seek_points(4, 8000),
+            vec![pt(0, 0, 0), pt(2000, 0, 0), pt(4000, 0, 0), pt(6000, 0, 0)],
+        );
+        assert_eq!(
+            spaced_seek_points(3, 10),
+            vec![pt(0, 0, 0), pt(3, 0, 0), pt(6, 0, 0)], // 10*1/3=3, 10*2/3=6
+        );
+        assert!(spaced_seek_points(0, 8000).is_empty());
+        assert!(spaced_seek_points(4, 0).is_empty());
+    }
+
+    #[test]
+    fn sort_dedups_and_pads_with_placeholders() {
+        // Multiple targets that resolved to the same frame become identical points;
+        // the sort keeps one and pushes the freed slots to the tail as placeholders,
+        // preserving the count. (Mirrors FLAC__format_seektable_sort.)
+        let mut points = vec![
+            pt(30, 300, 2048),
+            pt(10, 100, 2048),
+            pt(10, 100, 2048), // duplicate of the previous (same frame)
+            placeholder(),
+            pt(20, 200, 2048),
+        ];
+        seektable_sort(&mut points);
+        assert_eq!(
+            points,
+            vec![
+                pt(10, 100, 2048),
+                pt(20, 200, 2048),
+                pt(30, 300, 2048),
+                placeholder(),
+                placeholder(),
+            ],
+        );
+    }
+
+    #[test]
+    fn sort_keeps_existing_placeholders_at_tail() {
+        let mut points = vec![placeholder(), pt(5, 50, 2048), placeholder()];
+        seektable_sort(&mut points);
+        assert_eq!(points, vec![pt(5, 50, 2048), placeholder(), placeholder()]);
+    }
+
+    #[test]
+    fn seektable_byte_layout() {
+        let mut bw = BitWriter::new();
+        write_seektable(
+            &mut bw,
+            &[pt(0x0102_0304_0506_0708, 0x1112_1314_1516_1718, 2048)],
+            true,
+        );
+        assert_eq!(
+            bw.as_bytes(),
+            &[
+                0x83, 0x00, 0x00, 0x12, // is_last=1 | type=3, length=18
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // sample_number
+                0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // stream_offset
+                0x08, 0x00, // frame_samples = 2048
+            ],
+        );
+    }
 }

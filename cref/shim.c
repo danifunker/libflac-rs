@@ -396,6 +396,93 @@ int libflac_rs_cref_encode_full_picture(
     return 0;
 }
 
+/* Encode a complete FLAC stream with one SEEKTABLE metadata block, to verify the
+ * Rust SEEKTABLE byte-for-byte. The caller supplies `num_points` target sample
+ * numbers; the block is filled as a template (sample_number = target,
+ * stream_offset/frame_samples = 0) and libFLAC generates + sorts + rewrites it
+ * during encoding (the seekable mem_sink lets it seek back). As with the other
+ * metadata shims, with metadata set explicitly libFLAC still prepends its default
+ * VORBIS_COMMENT, so the output is STREAMINFO + VORBIS_COMMENT + SEEKTABLE +
+ * frames. The targets must be strictly increasing (FLAC__format_seektable_is_legal,
+ * checked at init). */
+int libflac_rs_cref_encode_full_seektable(
+    const int32_t *interleaved, uint32_t nsamples, uint32_t channels, uint32_t bps,
+    uint32_t sample_rate, uint32_t blocksize, int32_t compression_level,
+    int32_t do_md5, const uint64_t *sample_numbers, uint32_t num_points,
+    uint8_t *out, size_t *out_len) {
+    mem_sink sink;
+    FLAC__StreamEncoder *enc;
+    FLAC__StreamEncoderInitStatus init;
+    FLAC__StreamMetadata st;
+    FLAC__StreamMetadata *metas[1];
+    FLAC__StreamMetadata_SeekPoint *pts;
+    uint32_t i;
+    int rc = 0;
+
+    sink.buf = out;
+    sink.cap = *out_len;
+    sink.pos = 0;
+    sink.len = 0;
+    sink.overflow = 0;
+
+    enc = FLAC__stream_encoder_new();
+    if (!enc) {
+        return -1;
+    }
+    FLAC__stream_encoder_set_verify(enc, false);
+    FLAC__stream_encoder_set_compression_level(
+        enc, compression_level >= 0 ? (uint32_t)compression_level : 8);
+    FLAC__stream_encoder_set_channels(enc, channels);
+    FLAC__stream_encoder_set_bits_per_sample(enc, bps);
+    FLAC__stream_encoder_set_sample_rate(enc, sample_rate);
+    FLAC__stream_encoder_set_total_samples_estimate(enc, 0);
+    FLAC__stream_encoder_set_streamable_subset(enc, false);
+    FLAC__stream_encoder_set_blocksize(enc, blocksize);
+    FLAC__stream_encoder_set_do_md5(enc, do_md5 != 0);
+
+    pts = (FLAC__StreamMetadata_SeekPoint *)malloc((size_t)num_points * sizeof(*pts));
+    if (!pts) {
+        FLAC__stream_encoder_delete(enc);
+        return -1;
+    }
+    for (i = 0; i < num_points; i++) {
+        pts[i].sample_number = sample_numbers[i];
+        pts[i].stream_offset = 0;
+        pts[i].frame_samples = 0;
+    }
+    memset(&st, 0, sizeof(st));
+    st.type = FLAC__METADATA_TYPE_SEEKTABLE;
+    st.is_last = false;
+    st.length = num_points * FLAC__STREAM_METADATA_SEEKPOINT_LENGTH;
+    st.data.seek_table.num_points = num_points;
+    st.data.seek_table.points = pts;
+    metas[0] = &st;
+    FLAC__stream_encoder_set_metadata(enc, metas, 1);
+
+    init = FLAC__stream_encoder_init_stream(enc, mem_write, mem_seek, mem_tell,
+                                            NULL, &sink);
+    if (init != FLAC__STREAM_ENCODER_INIT_STATUS_OK) {
+        free(pts);
+        FLAC__stream_encoder_delete(enc);
+        return -100 - (int)init;
+    }
+    if (!FLAC__stream_encoder_process_interleaved(enc, interleaved, nsamples)) {
+        rc = -200 - (int)FLAC__stream_encoder_get_state(enc);
+    } else if (!FLAC__stream_encoder_finish(enc)) {
+        rc = -300 - (int)FLAC__stream_encoder_get_state(enc);
+    }
+    FLAC__stream_encoder_delete(enc);
+    free(pts);
+    if (rc != 0) {
+        return rc;
+    }
+    if (sink.overflow) {
+        return -2;
+    }
+    *out_len = sink.len;
+    return 0;
+}
+
 /* ---- Decoder round-trip --------------------------------------------------
  * Decode a complete in-memory FLAC stream back to interleaved PCM via the real
  * libFLAC decoder, to prove the Rust full-stream output is a valid, decodable
