@@ -9,9 +9,10 @@ reference to port, the data shapes, the bit-exactness traps, and how to verify.
 config** and has generalized to **all levels (0–8)**, **bit depths 8/12/16/20/24**,
 and **complete `.flac` files** at **every standard bit depth (8–32)** — and a
 **decoder** that losslessly round-trips the encoder and reads real libFLAC output
-(MD5-verified). Phases **0–8 are DONE** (full metadata incl. SEEKTABLE + CUESHEET),
-and **Phase 9's decoder core** too; remaining: decoder seeking/streaming polish
-(Phase 9), Ogg (Phase 10), and the public API + publish (Phase 11).
+(MD5-verified). Phases **0–9 are DONE** — full metadata (incl. SEEKTABLE + CUESHEET)
+and a complete decoder with `seek()` and variable-block-size support; remaining: Ogg
+(Phase 10) and the public API + publish (Phase 11, which also absorbs the streaming
+decode API).
 
 ```
 DONE   Phase 0  Bitwriter + CRC                      █████████
@@ -24,8 +25,8 @@ DONE   Phase 6  Bit depths 8/12/16/20/24 (RICE2)     █████████
 DONE   Phase 7  32-bit / wide-residual paths         █████████
 DONE   Phase 8  Metadata: APPLICATION + PICTURE +     █████████
                  SEEKTABLE + CUESHEET (all byte-exact)
-DONE*  Phase 9  The decoder (core: round-trips +      ████████░
-                 reads real libFLAC; polish left)
+DONE   Phase 9  The decoder: round-trips, reads real  █████████
+                 libFLAC, seek() + variable blocksize
 TODO   Phase 10 Ogg FLAC (optional)                  ░░░░░░░░░
 TODO   Phase 11 Public API, docs, publish            ░░░░░░░░░
 ```
@@ -249,7 +250,7 @@ through libFLAC's decoder and compare parsed blocks.
 
 ---
 
-# DONE* — Phase 9: the decoder (core complete; seeking/streaming API left)
+# DONE — Phase 9: the decoder (seek + variable block size; streaming API in Phase 11)
 
 **Status: the decode logic is implemented and verified.** A pure-Rust decoder
 (`bitreader.rs` + `decoder.rs`) turns FLAC bytes back into the exact original PCM
@@ -257,12 +258,13 @@ with CRC-8/CRC-16 and MD5 verification. It decodes **complete streams the C
 reference produced** (`decode_libflac_streams`) and **round-trips the whole
 encoder corpus losslessly** (`decode(encode(pcm)) == pcm`) across 8/12/16/20/24/32-bit,
 mono+stereo, levels 0–8, with the embedded MD5 verifying. All restore math is
-`i64`, so the 33-bit side channel is exact. **SEEKTABLE-driven `seek()` is now done**
+`i64`, so the 33-bit side channel is exact. **SEEKTABLE-driven `seek()`** is done
 (`decode_seek` — jump to the nearest seek point, then decode forward to the exact
-target sample; verified by exact-sample round-trips with and without a seektable).
-**Remaining polish:** variable-block-size streams (`read_utf8_u64` sample numbers)
-and an incremental/streaming decode API (folds into Phase 11). The implementation
-record follows.
+target sample; verified by exact-sample round-trips with and without a seektable),
+and so is **variable-block-size decoding** (`read_utf8_u64` for the sample-number
+header field, selected by the blocking-strategy bit). The only Phase 9 item left is
+an **incremental/streaming decode API**, which folds into the Phase 11 public API.
+The implementation record follows.
 
 **Files (new):** `bitreader.rs`, `decoder.rs` (+ reuse `lpc::restore`,
 `fixed::restore`, `crc`, `md5`, `metadata` parsing).

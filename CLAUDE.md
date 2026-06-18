@@ -234,8 +234,10 @@ diffing at the first mismatching field to localize float drift.
   escape), `i64` fixed/LPC restore, L/S·R/S·M/S un-decorrelation, CRC-16. The
   decoder is *not* byte-parity work — it's verified by **lossless round-trip**
   (`decode(encode(pcm)) == pcm`, all depths/levels, MD5 ok) and by **decoding real
-  libFLAC output** (`decode_libflac_streams`). Remaining: variable block size
-  (`read_utf8_u64`), SEEKTABLE seeking, and a streaming API. Then metadata, Ogg.
+  libFLAC output** (`decode_libflac_streams`). Phase 9 then added **SEEKTABLE-driven
+  `seek()`** (`decode_seek`) and **variable-block-size** decoding (`read_utf8_u64`,
+  selected by the blocking-strategy bit). Remaining: a streaming/push API (Phase 11)
+  and Ogg (Phase 10).
 
 ## Conventions
 

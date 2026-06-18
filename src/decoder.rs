@@ -270,13 +270,21 @@ fn decode_frame(br: &mut BitReader, data: &[u8]) -> Option<Frame> {
         return None; // sync
     }
     let _reserved = br.read_raw_u32(1)?;
-    let _blocking_strategy = br.read_raw_u32(1)?; // 0 = fixed block size
+    let blocking_strategy = br.read_raw_u32(1)?; // 0 = fixed, 1 = variable block size
     let bs_code = br.read_raw_u32(4)?;
     let sr_code = br.read_raw_u32(4)?;
     let ca_code = br.read_raw_u32(4)?;
     let bps_code = br.read_raw_u32(3)?;
     let _reserved2 = br.read_raw_u32(1)?;
-    let _frame_number = br.read_utf8_u32()?; // fixed block size -> frame number
+    // Fixed block size carries the frame number (UTF-8 u32); variable carries the
+    // first sample number (UTF-8 u64). We track samples by summing block sizes, so
+    // the value is discarded — but the two forms consume different byte counts, so
+    // the right one must be read for the rest of the header (and CRC-8) to align.
+    if blocking_strategy == 0 {
+        let _frame_number = br.read_utf8_u32()?;
+    } else {
+        let _sample_number = br.read_utf8_u64()?;
+    }
 
     let blocksize = match bs_code {
         1 => 192,
@@ -518,6 +526,7 @@ fn sign_extend5(v: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{decode, decode_frames, decode_seek};
+    use crate::bitwriter::BitWriter;
     use crate::encoder::{encode, encode_frames, preset};
     use crate::metadata::{LIBFLAC_VENDOR_STRING, MetadataBlock, spaced_seek_points};
 
@@ -681,5 +690,39 @@ mod tests {
                 assert!(decode_seek(&stream, total).is_none());
             }
         }
+    }
+
+    /// The encoder only writes fixed-block-size frames, so hand-build a
+    /// variable-block-size frame (blocking-strategy bit = 1, a UTF-8 u64 *sample*
+    /// number) and confirm the decoder reads the wider header field, keeps CRC-8
+    /// alignment, and decodes the subframe. A mono 16-bit CONSTANT frame, block
+    /// size 4, sample number `0x123456` (a 4-byte UTF-8 code).
+    #[test]
+    fn decodes_variable_block_size_frame() {
+        let mut bw = BitWriter::new();
+        bw.write_raw_u32(0x3FFE, 14); // sync
+        bw.write_raw_u32(0, 1); // reserved
+        bw.write_raw_u32(1, 1); // blocking strategy = variable
+        bw.write_raw_u32(6, 4); // block-size code 6 => 8-bit (blocksize-1) follows
+        bw.write_raw_u32(9, 4); // sample-rate code 9 = 44100
+        bw.write_raw_u32(0, 4); // channel assignment 0 = mono
+        bw.write_raw_u32(4, 3); // sample-size code 4 = 16 bps
+        bw.write_raw_u32(0, 1); // reserved
+        bw.write_utf8_u64(0x123456); // sample number (4-byte UTF-8)
+        bw.write_raw_u32(4 - 1, 8); // block size hint: blocksize - 1 = 3
+        let header_crc = bw.crc8(); // CRC-8 over the (byte-aligned) header
+        bw.write_raw_u32(header_crc as u32, 8);
+        // CONSTANT subframe (header 0x00) holding the value 1000.
+        bw.write_raw_u32(0x00, 8);
+        bw.write_raw_u32(1000, 16);
+        let frame_crc = bw.crc16(); // CRC-16 over the whole frame so far
+        bw.write_raw_u32(frame_crc as u32, 16);
+        let frame = bw.as_bytes().to_vec();
+
+        let dec = decode_frames(&frame).expect("decode variable-block-size frame");
+        assert_eq!(dec.channels, 1);
+        assert_eq!(dec.bits_per_sample, 16);
+        assert_eq!(dec.sample_rate, 44_100);
+        assert_eq!(dec.interleaved, vec![1000i32; 4]);
     }
 }

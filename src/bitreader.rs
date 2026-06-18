@@ -138,6 +138,39 @@ impl<'a> BitReader<'a> {
         Some(v)
     }
 
+    /// Decode a UTF-8-style coded 36-bit value (`FLAC__bitreader_read_utf8_uint64`),
+    /// used for the sample number of a variable-block-size frame. Like
+    /// [`Self::read_utf8_u32`] with one extra (7-byte, `0xFE` lead) length. Returns
+    /// `0xFFFF_FFFF_FFFF_FFFF` on a malformed sequence, `None` only on truncation.
+    pub fn read_utf8_u64(&mut self) -> Option<u64> {
+        let x = self.read_raw_u32(8)? as u64;
+        let (mut v, n) = if x & 0x80 == 0 {
+            (x, 0)
+        } else if x & 0xC0 != 0 && x & 0x20 == 0 {
+            (x & 0x1F, 1)
+        } else if x & 0xE0 != 0 && x & 0x10 == 0 {
+            (x & 0x0F, 2)
+        } else if x & 0xF0 != 0 && x & 0x08 == 0 {
+            (x & 0x07, 3)
+        } else if x & 0xF8 != 0 && x & 0x04 == 0 {
+            (x & 0x03, 4)
+        } else if x & 0xFC != 0 && x & 0x02 == 0 {
+            (x & 0x01, 5)
+        } else if x & 0xFE != 0 && x & 0x01 == 0 {
+            (0, 6) // 7-byte form: the 0xFE lead carries no value bits
+        } else {
+            return Some(0xFFFF_FFFF_FFFF_FFFF);
+        };
+        for _ in 0..n {
+            let x = self.read_raw_u32(8)? as u64;
+            if x & 0x80 == 0 || x & 0x40 != 0 {
+                return Some(0xFFFF_FFFF_FFFF_FFFF);
+            }
+            v = (v << 6) | (x & 0x3F);
+        }
+        Some(v)
+    }
+
     /// Skip to the next byte boundary (used before a frame's CRC-16).
     pub fn align_to_byte(&mut self) {
         self.pos = (self.pos + 7) & !7;
@@ -258,6 +291,32 @@ mod tests {
             let bytes = bw.as_bytes().to_vec();
             let mut br = BitReader::new(&bytes);
             assert_eq!(br.read_utf8_u32(), Some(v), "utf8 {v:#x}");
+        }
+    }
+
+    #[test]
+    fn utf8_u64_round_trips() {
+        // Through the 7-byte form: 0x8000_0000 first needs it; 0xF_FFFF_FFFF is the
+        // largest 36-bit value (a variable-block-size sample number).
+        for v in [
+            0u64,
+            0x7F,
+            0x80,
+            0x7FF,
+            0x800,
+            0xFFFF,
+            0x1F_FFFF,
+            0x20_0000,
+            0x7FFF_FFFF,
+            0x8000_0000,
+            0xF_FFFF_FFFF,
+        ] {
+            let mut bw = BitWriter::new();
+            bw.write_utf8_u64(v);
+            bw.zero_pad_to_byte_boundary();
+            let bytes = bw.as_bytes().to_vec();
+            let mut br = BitReader::new(&bytes);
+            assert_eq!(br.read_utf8_u64(), Some(v), "utf8_u64 {v:#x}");
         }
     }
 }

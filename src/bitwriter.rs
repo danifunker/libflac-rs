@@ -180,6 +180,54 @@ impl BitWriter {
         }
     }
 
+    /// UTF-8-style coding of a 36-bit value (`FLAC__bitwriter_write_utf8_uint64`),
+    /// used for the sample number in a variable-block-size stream. Extends the 6-byte
+    /// UTF-8 form with a 7-byte form (`0xFE` lead, no value bits) for 32–36 bits.
+    pub fn write_utf8_u64(&mut self, val: u64) {
+        debug_assert_eq!(
+            val & 0xFFFF_FFF0_0000_0000,
+            0,
+            "write_utf8_u64 handles 36 bits"
+        );
+        if val < 0x80 {
+            self.write_raw_u32(val as u32, 8);
+        } else if val < 0x800 {
+            self.write_raw_u32(0xC0 | (val >> 6) as u32, 8);
+            self.write_raw_u32(0x80 | (val & 0x3F) as u32, 8);
+        } else if val < 0x10000 {
+            self.write_raw_u32(0xE0 | (val >> 12) as u32, 8);
+            self.write_raw_u32(0x80 | ((val >> 6) & 0x3F) as u32, 8);
+            self.write_raw_u32(0x80 | (val & 0x3F) as u32, 8);
+        } else if val < 0x200000 {
+            self.write_raw_u32(0xF0 | (val >> 18) as u32, 8);
+            self.write_raw_u32(0x80 | ((val >> 12) & 0x3F) as u32, 8);
+            self.write_raw_u32(0x80 | ((val >> 6) & 0x3F) as u32, 8);
+            self.write_raw_u32(0x80 | (val & 0x3F) as u32, 8);
+        } else if val < 0x4000000 {
+            self.write_raw_u32(0xF8 | (val >> 24) as u32, 8);
+            self.write_raw_u32(0x80 | ((val >> 18) & 0x3F) as u32, 8);
+            self.write_raw_u32(0x80 | ((val >> 12) & 0x3F) as u32, 8);
+            self.write_raw_u32(0x80 | ((val >> 6) & 0x3F) as u32, 8);
+            self.write_raw_u32(0x80 | (val & 0x3F) as u32, 8);
+        } else if val < 0x80000000 {
+            self.write_raw_u32(0xFC | (val >> 30) as u32, 8);
+            self.write_raw_u32(0x80 | ((val >> 24) & 0x3F) as u32, 8);
+            self.write_raw_u32(0x80 | ((val >> 18) & 0x3F) as u32, 8);
+            self.write_raw_u32(0x80 | ((val >> 12) & 0x3F) as u32, 8);
+            self.write_raw_u32(0x80 | ((val >> 6) & 0x3F) as u32, 8);
+            self.write_raw_u32(0x80 | (val & 0x3F) as u32, 8);
+        } else {
+            // 7-byte form: 0xFE lead carries no value bits; six continuations = 36b.
+            self.write_raw_u32(0xFE, 8);
+            self.write_raw_u32(0x80 | ((val >> 30) & 0x3F) as u32, 8);
+            self.write_raw_u32(0x80 | ((val >> 24) & 0x3F) as u32, 8);
+            self.write_raw_u32(0x80 | ((val >> 18) & 0x3F) as u32, 8);
+            self.write_raw_u32(0x80 | ((val >> 12) & 0x3F) as u32, 8);
+            self.write_raw_u32(0x80 | ((val >> 6) & 0x3F) as u32, 8);
+            self.write_raw_u32(0x80 | (val & 0x3F) as u32, 8);
+        }
+    }
+
     /// Rice-code a block of signed residuals with a single parameter
     /// (`FLAC__bitwriter_write_rice_signed_block`). Per value: `msbs` zero bits, a
     /// `1` stop bit, then the low `parameter` bits of the zigzag-folded value. The
