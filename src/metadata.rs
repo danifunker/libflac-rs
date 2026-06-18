@@ -41,7 +41,7 @@ pub const SEEKPOINT_PLACEHOLDER: u64 = 0xffff_ffff_ffff_ffff;
 /// One SEEKTABLE seek point (`FLAC__StreamMetadata_SeekPoint`). In a *template*
 /// (before encoding) `sample_number` is the target sample to make seekable and the
 /// other two fields are 0; the encoder rewrites all three for the frame that holds
-/// each target (see [`crate::encoder`]).
+/// each target (see [`Encoder`](crate::Encoder)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SeekPoint {
     pub sample_number: u64,
@@ -89,7 +89,7 @@ pub enum MetadataBlock<'a> {
     Application { id: [u8; 4], data: &'a [u8] },
     /// A SEEKTABLE block: the seek points to serialize, in order. The encoder fills
     /// a *template* (each point's `sample_number` a target, offsets 0) during
-    /// encoding and writes the filled+sorted result; [`write_seektable`] serializes
+    /// encoding and writes the filled+sorted result; `write_seektable` serializes
     /// whatever points it is given verbatim.
     Seektable(&'a [SeekPoint]),
     /// A CUESHEET block: the 128-byte media catalog number, lead-in samples, the

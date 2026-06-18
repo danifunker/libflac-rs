@@ -23,8 +23,9 @@ pub struct DecodedFrames {
 }
 
 /// Decode every audio frame in `data` (the raw frame stream produced by
-/// [`crate::encoder::encode_frames`], i.e. no metadata) back to interleaved PCM.
-/// Returns `None` on any malformed/truncated input or CRC mismatch.
+/// [`Encoder::encode_frames`](crate::Encoder::encode_frames), i.e. no metadata) back
+/// to interleaved PCM. Returns `None` on any malformed/truncated input or CRC
+/// mismatch.
 pub fn decode_frames(data: &[u8]) -> Option<DecodedFrames> {
     let mut br = BitReader::new(data);
     let mut interleaved = Vec::new();
