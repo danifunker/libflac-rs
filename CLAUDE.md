@@ -211,10 +211,10 @@ diffing at the first mismatching field to localize float drift.
   decode round-trip (`libflac_rs_cref_decode`). `encode` also writes the optional
   VORBIS_COMMENT (vendor) + PADDING blocks: with `metadata::LIBFLAC_VENDOR_STRING`
   and no padding the **entire** stream is byte-identical to libFLAC's default
-  output (`libflac_rs_cref_vendor_string` confirms the version string). APPLICATION,
-  PICTURE, and SEEKTABLE blocks followed in ROADMAP Phase 8 (all byte-exact vs
-  libFLAC); SEEKTABLE is *generated* during encoding (`fill_seekpoints` +
-  `metadata::seektable_sort`). Not yet written: CUESHEET.
+  output (`libflac_rs_cref_vendor_string` confirms the version string). ROADMAP
+  Phase 8 finished the remaining metadata blocks — APPLICATION, PICTURE, SEEKTABLE,
+  and CUESHEET — all byte-exact vs libFLAC; SEEKTABLE is *generated* during
+  encoding (`fill_seekpoints` + `metadata::seektable_sort`).
 - **G3 — DONE (all bit depths 8/12/16/20/24/32).** RICE2 (5-bit params, escape 31)
   is selected per partition when any rice parameter reaches 15
   (`RicePartition::is_rice2`), driven by the `bps>16 ? 31 : 15` rice-parameter

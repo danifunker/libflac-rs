@@ -27,6 +27,7 @@ const METADATA_TYPE_PADDING: u32 = 1;
 const METADATA_TYPE_APPLICATION: u32 = 2;
 const METADATA_TYPE_SEEKTABLE: u32 = 3;
 const METADATA_TYPE_VORBIS_COMMENT: u32 = 4;
+const METADATA_TYPE_CUESHEET: u32 = 5;
 const METADATA_TYPE_PICTURE: u32 = 6;
 /// STREAMINFO body length in bytes.
 const STREAMINFO_LENGTH: u32 = 34;
@@ -48,6 +49,34 @@ pub struct SeekPoint {
     pub frame_samples: u32,
 }
 
+/// CUESHEET bit-lengths (`format.h`) for the non-byte-aligned reserved runs.
+/// Cuesheet-level reserved after `is_cd` is `7 + 258*8` bits; per-track reserved
+/// after the two flag bits is `6 + 13*8`; per-index reserved is `3*8`.
+const CUESHEET_RESERVED_BITS: u32 = 7 + 258 * 8;
+const CUESHEET_TRACK_RESERVED_BITS: u32 = 6 + 13 * 8;
+const CUESHEET_INDEX_RESERVED_BITS: u32 = 3 * 8;
+
+/// One CUESHEET track index point (`FLAC__StreamMetadata_CueSheet_Index`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CueSheetIndex {
+    /// Offset in samples relative to the track offset.
+    pub offset: u64,
+    pub number: u8,
+}
+
+/// One CUESHEET track (`FLAC__StreamMetadata_CueSheet_Track`).
+pub struct CueSheetTrack<'a> {
+    /// Offset in samples from the start of the stream.
+    pub offset: u64,
+    pub number: u8,
+    /// 12-byte ISRC (zero-filled when unset).
+    pub isrc: [u8; 12],
+    /// The track type bit: `false` = audio, `true` = non-audio.
+    pub non_audio: bool,
+    pub pre_emphasis: bool,
+    pub indices: &'a [CueSheetIndex],
+}
+
 /// A metadata block the caller can place after STREAMINFO (which the encoder
 /// always writes first). libFLAC writes blocks in the order given (the OGG
 /// reorder is compiled out for native FLAC), so this list maps 1:1 to the output.
@@ -63,6 +92,15 @@ pub enum MetadataBlock<'a> {
     /// encoding and writes the filled+sorted result; [`write_seektable`] serializes
     /// whatever points it is given verbatim.
     Seektable(&'a [SeekPoint]),
+    /// A CUESHEET block: the 128-byte media catalog number, lead-in samples, the
+    /// CD-DA flag, and the track list (each with its index points). Fully
+    /// caller-supplied — unlike SEEKTABLE, nothing is generated during encoding.
+    CueSheet {
+        media_catalog_number: &'a [u8; 128],
+        lead_in: u64,
+        is_cd: bool,
+        tracks: &'a [CueSheetTrack<'a>],
+    },
     /// A PICTURE block (e.g. cover art). `mime_type`/`description` are stored with
     /// 32-bit length prefixes; `picture_type` is the FLAC picture-type code.
     Picture {
@@ -84,6 +122,12 @@ pub fn write_block(bw: &mut BitWriter, block: &MetadataBlock, is_last: bool) {
         MetadataBlock::Padding(len) => write_padding(bw, *len, is_last),
         MetadataBlock::Application { id, data } => write_application(bw, id, data, is_last),
         MetadataBlock::Seektable(points) => write_seektable(bw, points, is_last),
+        MetadataBlock::CueSheet {
+            media_catalog_number,
+            lead_in,
+            is_cd,
+            tracks,
+        } => write_cuesheet(bw, media_catalog_number, *lead_in, *is_cd, tracks, is_last),
         MetadataBlock::Picture {
             picture_type,
             mime_type,
@@ -197,6 +241,52 @@ pub fn seektable_sort(points: &mut [SeekPoint]) {
             stream_offset: 0,
             frame_samples: 0,
         };
+    }
+}
+
+/// The serialized body length of a CUESHEET (`stream_encoder_framing.c:154`): a
+/// 396-byte fixed header (128-byte catalog + 8-byte lead-in + 259 bytes of
+/// `is_cd`+reserved + 1-byte track count), then 36 bytes per track plus 12 bytes
+/// per index. Every field run lands on a byte boundary, so this is exact.
+fn cuesheet_length(tracks: &[CueSheetTrack]) -> u32 {
+    let mut len = 396u32;
+    for t in tracks {
+        len += 36 + t.indices.len() as u32 * 12;
+    }
+    len
+}
+
+/// Write a CUESHEET block (`stream_encoder_framing.c:154`). All fields are
+/// big-endian/MSB-first; the reserved runs (`7+258*8`, `6+13*8`, `3*8` bits) are
+/// **not** byte-aligned individually but each track/index boundary is. `is_cd` is a
+/// single bit; the track `type` bit is `non_audio`.
+pub fn write_cuesheet(
+    bw: &mut BitWriter,
+    media_catalog_number: &[u8; 128],
+    lead_in: u64,
+    is_cd: bool,
+    tracks: &[CueSheetTrack],
+    is_last: bool,
+) {
+    write_block_header(bw, is_last, METADATA_TYPE_CUESHEET, cuesheet_length(tracks));
+    bw.write_byte_block(media_catalog_number);
+    bw.write_raw_u64(lead_in, 64);
+    bw.write_raw_u32(is_cd as u32, 1);
+    bw.write_zeroes(CUESHEET_RESERVED_BITS);
+    bw.write_raw_u32(tracks.len() as u32, 8);
+    for t in tracks {
+        bw.write_raw_u64(t.offset, 64);
+        bw.write_raw_u32(t.number as u32, 8);
+        bw.write_byte_block(&t.isrc);
+        bw.write_raw_u32(t.non_audio as u32, 1);
+        bw.write_raw_u32(t.pre_emphasis as u32, 1);
+        bw.write_zeroes(CUESHEET_TRACK_RESERVED_BITS);
+        bw.write_raw_u32(t.indices.len() as u32, 8);
+        for idx in t.indices {
+            bw.write_raw_u64(idx.offset, 64);
+            bw.write_raw_u32(idx.number as u32, 8);
+            bw.write_zeroes(CUESHEET_INDEX_RESERVED_BITS);
+        }
     }
 }
 
@@ -328,5 +418,44 @@ mod tests {
                 0x08, 0x00, // frame_samples = 2048
             ],
         );
+    }
+
+    #[test]
+    fn cuesheet_byte_layout() {
+        let mcn = [0u8; 128];
+        let indices = [CueSheetIndex {
+            offset: 0x1122_3344_5566_7788,
+            number: 1,
+        }];
+        let tracks = [CueSheetTrack {
+            offset: 0x0102_0304_0506_0708,
+            number: 7,
+            isrc: *b"ABCDEFGHIJKL",
+            non_audio: true,
+            pre_emphasis: false,
+            indices: &indices,
+        }];
+        let mut bw = BitWriter::new();
+        write_cuesheet(&mut bw, &mcn, 0x00FF_00FF_00FF_00FF, true, &tracks, true);
+        let out = bw.as_bytes();
+
+        // 4-byte block header + 396 fixed + 36 (one track) + 12 (one index) = 448.
+        assert_eq!(out.len(), 448);
+        // is_last=1 | type=5 (0x85); body length = 444 = 0x0001BC.
+        assert_eq!(&out[0..4], &[0x85, 0x00, 0x01, 0xBC]);
+        assert_eq!(&out[4..132], &[0u8; 128]); // media catalog number
+        assert_eq!(&out[132..140], &0x00FF_00FF_00FF_00FFu64.to_be_bytes()); // lead_in
+        assert_eq!(out[140], 0x80); // is_cd bit set, then reserved zeros
+        assert_eq!(&out[141..399], &[0u8; 258]); // rest of the cuesheet reserved
+        assert_eq!(out[399], 1); // num_tracks
+        assert_eq!(&out[400..408], &0x0102_0304_0506_0708u64.to_be_bytes()); // track offset
+        assert_eq!(out[408], 7); // track number
+        assert_eq!(&out[409..421], b"ABCDEFGHIJKL"); // isrc
+        assert_eq!(out[421], 0b1000_0000); // type=1 (non_audio), pre_emphasis=0
+        assert_eq!(&out[422..435], &[0u8; 13]); // rest of the track reserved
+        assert_eq!(out[435], 1); // num_indices
+        assert_eq!(&out[436..444], &0x1122_3344_5566_7788u64.to_be_bytes()); // index offset
+        assert_eq!(out[444], 1); // index number
+        assert_eq!(&out[445..448], &[0u8; 3]); // index reserved
     }
 }

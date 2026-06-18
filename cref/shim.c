@@ -483,6 +483,121 @@ int libflac_rs_cref_encode_full_seektable(
     return 0;
 }
 
+/* Encode a complete FLAC stream with one CUESHEET metadata block, to verify the
+ * Rust CUESHEET byte-for-byte. The cuesheet is passed as scalars plus flattened
+ * per-track and (across all tracks, in order) per-index arrays, reassembled into a
+ * manually-filled FLAC__StreamMetadata_CueSheet that libFLAC serializes via
+ * FLAC__add_metadata_block. The cuesheet must be legal for its `is_cd` flag
+ * (FLAC__format_cuesheet_is_legal, checked at init). As with the other metadata
+ * shims, libFLAC prepends its default VORBIS_COMMENT, so the output is STREAMINFO +
+ * VORBIS_COMMENT + CUESHEET + frames. */
+int libflac_rs_cref_encode_full_cuesheet(
+    const int32_t *interleaved, uint32_t nsamples, uint32_t channels, uint32_t bps,
+    uint32_t sample_rate, uint32_t blocksize, int32_t compression_level,
+    int32_t do_md5, const uint8_t *media_catalog_number, uint64_t lead_in,
+    int32_t is_cd, uint32_t num_tracks, const uint64_t *track_offsets,
+    const uint8_t *track_numbers, const uint8_t *track_isrcs,
+    const uint8_t *track_types, const uint8_t *track_pre_emphasis,
+    const uint8_t *track_num_indices, const uint64_t *index_offsets,
+    const uint8_t *index_numbers, uint8_t *out, size_t *out_len) {
+    mem_sink sink;
+    FLAC__StreamEncoder *enc;
+    FLAC__StreamEncoderInitStatus init;
+    FLAC__StreamMetadata cs;
+    FLAC__StreamMetadata *metas[1];
+    FLAC__StreamMetadata_CueSheet_Track *tracks;
+    uint32_t i, j, idx_cursor = 0, length = 396;
+    int rc = 0;
+
+    sink.buf = out;
+    sink.cap = *out_len;
+    sink.pos = 0;
+    sink.len = 0;
+    sink.overflow = 0;
+
+    enc = FLAC__stream_encoder_new();
+    if (!enc) {
+        return -1;
+    }
+    FLAC__stream_encoder_set_verify(enc, false);
+    FLAC__stream_encoder_set_compression_level(
+        enc, compression_level >= 0 ? (uint32_t)compression_level : 8);
+    FLAC__stream_encoder_set_channels(enc, channels);
+    FLAC__stream_encoder_set_bits_per_sample(enc, bps);
+    FLAC__stream_encoder_set_sample_rate(enc, sample_rate);
+    FLAC__stream_encoder_set_total_samples_estimate(enc, 0);
+    FLAC__stream_encoder_set_streamable_subset(enc, false);
+    FLAC__stream_encoder_set_blocksize(enc, blocksize);
+    FLAC__stream_encoder_set_do_md5(enc, do_md5 != 0);
+
+    tracks = (FLAC__StreamMetadata_CueSheet_Track *)calloc(
+        num_tracks, sizeof(*tracks));
+    if (!tracks) {
+        FLAC__stream_encoder_delete(enc);
+        return -1;
+    }
+    for (i = 0; i < num_tracks; i++) {
+        tracks[i].offset = track_offsets[i];
+        tracks[i].number = track_numbers[i];
+        memcpy(tracks[i].isrc, track_isrcs + (size_t)i * 12, 12);
+        tracks[i].isrc[12] = 0;
+        tracks[i].type = track_types[i] & 1;
+        tracks[i].pre_emphasis = track_pre_emphasis[i] & 1;
+        tracks[i].num_indices = track_num_indices[i];
+        length += 36 + (uint32_t)track_num_indices[i] * 12;
+        if (track_num_indices[i] > 0) {
+            tracks[i].indices = (FLAC__StreamMetadata_CueSheet_Index *)calloc(
+                track_num_indices[i], sizeof(*tracks[i].indices));
+            for (j = 0; j < track_num_indices[i]; j++) {
+                tracks[i].indices[j].offset = index_offsets[idx_cursor];
+                tracks[i].indices[j].number = index_numbers[idx_cursor];
+                idx_cursor++;
+            }
+        } else {
+            tracks[i].indices = NULL;
+        }
+    }
+
+    memset(&cs, 0, sizeof(cs));
+    cs.type = FLAC__METADATA_TYPE_CUESHEET;
+    cs.is_last = false;
+    cs.length = length;
+    memcpy(cs.data.cue_sheet.media_catalog_number, media_catalog_number, 128);
+    cs.data.cue_sheet.media_catalog_number[128] = 0;
+    cs.data.cue_sheet.lead_in = lead_in;
+    cs.data.cue_sheet.is_cd = is_cd != 0;
+    cs.data.cue_sheet.num_tracks = num_tracks;
+    cs.data.cue_sheet.tracks = tracks;
+    metas[0] = &cs;
+    FLAC__stream_encoder_set_metadata(enc, metas, 1);
+
+    init = FLAC__stream_encoder_init_stream(enc, mem_write, mem_seek, mem_tell,
+                                            NULL, &sink);
+    if (init != FLAC__STREAM_ENCODER_INIT_STATUS_OK) {
+        rc = -100 - (int)init;
+    } else if (!FLAC__stream_encoder_process_interleaved(enc, interleaved,
+                                                         nsamples)) {
+        rc = -200 - (int)FLAC__stream_encoder_get_state(enc);
+    } else if (!FLAC__stream_encoder_finish(enc)) {
+        rc = -300 - (int)FLAC__stream_encoder_get_state(enc);
+    }
+
+    FLAC__stream_encoder_delete(enc);
+    for (i = 0; i < num_tracks; i++) {
+        free(tracks[i].indices);
+    }
+    free(tracks);
+
+    if (rc != 0) {
+        return rc;
+    }
+    if (sink.overflow) {
+        return -2;
+    }
+    *out_len = sink.len;
+    return 0;
+}
+
 /* ---- Decoder round-trip --------------------------------------------------
  * Decode a complete in-memory FLAC stream back to interleaved PCM via the real
  * libFLAC decoder, to prove the Rust full-stream output is a valid, decodable

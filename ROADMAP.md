@@ -9,9 +9,9 @@ reference to port, the data shapes, the bit-exactness traps, and how to verify.
 config** and has generalized to **all levels (0–8)**, **bit depths 8/12/16/20/24**,
 and **complete `.flac` files** at **every standard bit depth (8–32)** — and a
 **decoder** that losslessly round-trips the encoder and reads real libFLAC output
-(MD5-verified). Phases **0–7 are DONE**, and **Phase 9's decoder core** too;
-remaining: full metadata (Phase 8), decoder seeking/streaming polish, Ogg
-(Phase 10), and the public API + publish (Phase 11).
+(MD5-verified). Phases **0–8 are DONE** (full metadata incl. SEEKTABLE + CUESHEET),
+and **Phase 9's decoder core** too; remaining: decoder seeking/streaming polish
+(Phase 9), Ogg (Phase 10), and the public API + publish (Phase 11).
 
 ```
 DONE   Phase 0  Bitwriter + CRC                      █████████
@@ -22,8 +22,8 @@ DONE   Phase 4  Compression levels 0–8               ████████�
 DONE   Phase 5  Metadata + MD5 (full streams)        █████████
 DONE   Phase 6  Bit depths 8/12/16/20/24 (RICE2)     █████████
 DONE   Phase 7  32-bit / wide-residual paths         █████████
-WIP    Phase 8  Metadata: APPLICATION + PICTURE +     ███████░░
-                 SEEKTABLE done; CUESHEET left
+DONE   Phase 8  Metadata: APPLICATION + PICTURE +     █████████
+                 SEEKTABLE + CUESHEET (all byte-exact)
 DONE*  Phase 9  The decoder (core: round-trips +      ████████░
                  reads real libFLAC; polish left)
 TODO   Phase 10 Ogg FLAC (optional)                  ░░░░░░░░░
@@ -178,21 +178,23 @@ identical/anti/scaled L−R cases that force each channel assignment at 32-bit.
 
 ---
 
-# WIP — Phase 8: full metadata blocks + user metadata API
+# DONE — Phase 8: full metadata blocks + user metadata API
 
-**Status: framework + APPLICATION + PICTURE + SEEKTABLE done.**
-`metadata::MetadataBlock` (VorbisComment / Padding / Application / Picture /
-Seektable) is the user-metadata API; `encode()` takes an ordered `&[MetadataBlock]`
-after STREAMINFO. APPLICATION, PICTURE, and SEEKTABLE serialize **byte-identically
-to libFLAC** (verified via manually-filled C metadata structs in the shim — which
-also revealed libFLAC auto-prepends its default VORBIS_COMMENT to any user
-metadata) and round-trip through the decoder. SEEKTABLE is *generated* during
-encoding: a template of target sample numbers (build evenly-spaced ones with
-`metadata::spaced_seek_points`) is filled per-frame in `encode_frames_inner`
-(`fill_seekpoints`) then sorted/uniquified at finish (`metadata::seektable_sort`).
-The decoder parses SEEKTABLE into `DecodedStream::seek_points` (groundwork for
-Phase 9 `seek()`). **Remaining: CUESHEET** (niche; a nested track/index structure).
-The plan below covers it.
+**Status: DONE — all standard blocks emit byte-identically to libFLAC.**
+`metadata::MetadataBlock` (VorbisComment / Padding / Application / Seektable /
+CueSheet / Picture) is the user-metadata API; `encode()` takes an ordered
+`&[MetadataBlock]` after STREAMINFO. APPLICATION, PICTURE, SEEKTABLE, and CUESHEET
+all serialize **byte-identically to libFLAC** (verified via manually-filled C
+metadata structs in the shim — which also revealed libFLAC auto-prepends its
+default VORBIS_COMMENT to any user metadata) and round-trip through the decoder.
+SEEKTABLE is *generated* during encoding: a template of target sample numbers
+(build evenly-spaced ones with `metadata::spaced_seek_points`) is filled per-frame
+in `encode_frames_inner` (`fill_seekpoints`) then sorted/uniquified at finish
+(`metadata::seektable_sort`); the decoder parses it into
+`DecodedStream::seek_points` (groundwork for Phase 9 `seek()`). CUESHEET is fully
+caller-supplied (`MetadataBlock::CueSheet` + `CueSheetTrack`/`CueSheetIndex`),
+including the non-byte-aligned reserved runs and nested track/index lists; the
+decoder still skips it (no use until a metadata-read API in Phase 11).
 
 **Key finding (SEEKTABLE fill):** libFLAC fills each point from
 `FLAC__stream_encoder_get_blocksize()`, which `finish` lowers to the *actual*
@@ -222,11 +224,13 @@ decoder's per-type readers (`stream_decoder.c:1404-1491`) document each layout.
   placeholder point is `sample_number = 0xFFFFFFFFFFFFFFFF`. Built during encoding
   (`fill_seekpoints` + `seektable_sort`), byte-exact vs libFLAC.
 - **APPLICATION (2):** `id: [u8;4]` · application data (rest of `length`).
-- **CUESHEET (5):** `media_catalog_number: [u8;128]` · `lead_in: u64` ·
-  `is_cd: 1 bit` · `258 reserved bits (0)` · `num_tracks: u8` · then per track:
-  `offset: u64` · `number: u8` · `isrc: [u8;12]` · `is_audio: 1 bit` ·
+- **CUESHEET (5): DONE.** `media_catalog_number: [u8;128]` · `lead_in: u64` ·
+  `is_cd: 1 bit` · `7+258×8 reserved bits (0)` · `num_tracks: u8` · then per track:
+  `offset: u64` · `number: u8` · `isrc: [u8;12]` · `type: 1 bit` (0=audio) ·
   `pre_emphasis: 1 bit` · `6+13×8 reserved bits` · `num_indices: u8` · indices
-  (`offset: u64` · `number: u8` · `3 reserved bytes`).
+  (`offset: u64` · `number: u8` · `3 reserved bytes`). Byte-exact vs libFLAC
+  (`write_cuesheet`); the input must be legal for its `is_cd` flag, which the C
+  validates at init (`FLAC__format_cuesheet_is_legal`).
 - **PICTURE (6):** `type: u32` · `mime_len: u32` + MIME bytes · `desc_len: u32` +
   UTF-8 description · `width,height,depth,colors: u32` each · `data_len: u32` +
   image bytes. (All big-endian.)

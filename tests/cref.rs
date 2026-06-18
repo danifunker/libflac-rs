@@ -110,6 +110,31 @@ unsafe extern "C" {
         out: *mut u8,
         out_len: *mut usize,
     ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    fn libflac_rs_cref_encode_full_cuesheet(
+        interleaved: *const i32,
+        nsamples: u32,
+        channels: u32,
+        bps: u32,
+        sample_rate: u32,
+        blocksize: u32,
+        compression_level: i32,
+        do_md5: i32,
+        media_catalog_number: *const u8,
+        lead_in: u64,
+        is_cd: i32,
+        num_tracks: u32,
+        track_offsets: *const u64,
+        track_numbers: *const u8,
+        track_isrcs: *const u8,
+        track_types: *const u8,
+        track_pre_emphasis: *const u8,
+        track_num_indices: *const u8,
+        index_offsets: *const u64,
+        index_numbers: *const u8,
+        out: *mut u8,
+        out_len: *mut usize,
+    ) -> c_int;
     fn libflac_rs_cref_vendor_string(out: *mut u8, cap: usize) -> usize;
     fn libflac_rs_cref_crc8(data: *const u8, len: u32) -> u8;
     fn libflac_rs_cref_crc16(data: *const u8, len: u32) -> u16;
@@ -1567,6 +1592,183 @@ fn seektable_metadata_matches_c() {
                     prev = p.sample_number;
                 }
             }
+        }
+    }
+}
+
+/// One CUESHEET track for the test (owns its index list, flattened for the C FFI).
+struct CueTrack {
+    offset: u64,
+    number: u8,
+    isrc: [u8; 12],
+    non_audio: bool,
+    pre_emphasis: bool,
+    indices: Vec<libflac_rs::testing::CueSheetIndex>,
+}
+
+/// Phase 8: a CUESHEET block. Fully caller-supplied (no encoder generation), so the
+/// Rust serialization must match libFLAC byte-for-byte across the 396-byte fixed
+/// header, the non-byte-aligned reserved runs, and the nested track/index lists.
+/// Covers a non-CD cuesheet (a track with two indices + flag bits set, and a track
+/// with no indices) and a legal CD-DA cuesheet (`is_cd` triggers the stricter
+/// legality libFLAC validates at init). libFLAC prepends its default
+/// VORBIS_COMMENT, so the block list starts with it.
+#[test]
+fn cuesheet_metadata_matches_c() {
+    use libflac_rs::testing::{CueSheetIndex, CueSheetTrack};
+    let vendor = libflac_rs::testing::LIBFLAC_VENDOR_STRING;
+    let bs = 2048u32;
+    let pcm = gen_pcm_bps(11, bs as usize + 400, 16);
+    let mut mcn = [0u8; 128];
+    mcn[..13].copy_from_slice(b"CATALOG012345");
+
+    let cases: Vec<(&str, bool, u64, Vec<CueTrack>)> = vec![
+        (
+            "non_cd",
+            false,
+            0,
+            vec![
+                CueTrack {
+                    offset: 0,
+                    number: 1,
+                    isrc: *b"ABCDE1234567",
+                    non_audio: false,
+                    pre_emphasis: false,
+                    indices: vec![
+                        CueSheetIndex {
+                            offset: 0,
+                            number: 0,
+                        },
+                        CueSheetIndex {
+                            offset: 2000,
+                            number: 1,
+                        },
+                    ],
+                },
+                CueTrack {
+                    offset: 10000,
+                    number: 2,
+                    isrc: [0u8; 12],
+                    non_audio: true,
+                    pre_emphasis: true,
+                    indices: vec![],
+                },
+            ],
+        ),
+        (
+            "cd_da",
+            true,
+            88200, // 2s @ 44.1k, divisible by 588
+            vec![
+                CueTrack {
+                    offset: 0,
+                    number: 1,
+                    isrc: *b"US1234567890",
+                    non_audio: false,
+                    pre_emphasis: false,
+                    indices: vec![CueSheetIndex {
+                        offset: 0,
+                        number: 1,
+                    }],
+                },
+                CueTrack {
+                    offset: 176400, // divisible by 588
+                    number: 170,    // lead-out
+                    isrc: [0u8; 12],
+                    non_audio: false,
+                    pre_emphasis: false,
+                    indices: vec![],
+                },
+            ],
+        ),
+    ];
+
+    for (label, is_cd, lead_in, tracks) in &cases {
+        let rust_tracks: Vec<CueSheetTrack> = tracks
+            .iter()
+            .map(|t| CueSheetTrack {
+                offset: t.offset,
+                number: t.number,
+                isrc: t.isrc,
+                non_audio: t.non_audio,
+                pre_emphasis: t.pre_emphasis,
+                indices: &t.indices,
+            })
+            .collect();
+        // Flatten tracks + (cross-track, in order) indices for the C FFI.
+        let track_offsets: Vec<u64> = tracks.iter().map(|t| t.offset).collect();
+        let track_numbers: Vec<u8> = tracks.iter().map(|t| t.number).collect();
+        let track_isrcs: Vec<u8> = tracks.iter().flat_map(|t| t.isrc).collect();
+        let track_types: Vec<u8> = tracks.iter().map(|t| t.non_audio as u8).collect();
+        let track_pre: Vec<u8> = tracks.iter().map(|t| t.pre_emphasis as u8).collect();
+        let track_nidx: Vec<u8> = tracks.iter().map(|t| t.indices.len() as u8).collect();
+        let idx_offsets: Vec<u64> = tracks
+            .iter()
+            .flat_map(|t| t.indices.iter().map(|ix| ix.offset))
+            .collect();
+        let idx_numbers: Vec<u8> = tracks
+            .iter()
+            .flat_map(|t| t.indices.iter().map(|ix| ix.number))
+            .collect();
+
+        for level in [0u32, 8] {
+            let rust = libflac_rs::testing::encode(
+                &pcm,
+                2,
+                16,
+                44_100,
+                bs,
+                &libflac_rs::testing::preset(level),
+                true,
+                &[
+                    MetadataBlock::VorbisComment(vendor),
+                    MetadataBlock::CueSheet {
+                        media_catalog_number: &mcn,
+                        lead_in: *lead_in,
+                        is_cd: *is_cd,
+                        tracks: &rust_tracks,
+                    },
+                ],
+            );
+            let mut out = vec![0u8; pcm.len() * 4 + 8192];
+            let mut out_len = out.len();
+            let rc = unsafe {
+                libflac_rs_cref_encode_full_cuesheet(
+                    pcm.as_ptr(),
+                    (pcm.len() / 2) as u32,
+                    2,
+                    16,
+                    44_100,
+                    bs,
+                    level as i32,
+                    1,
+                    mcn.as_ptr(),
+                    *lead_in,
+                    *is_cd as i32,
+                    tracks.len() as u32,
+                    track_offsets.as_ptr(),
+                    track_numbers.as_ptr(),
+                    track_isrcs.as_ptr(),
+                    track_types.as_ptr(),
+                    track_pre.as_ptr(),
+                    track_nidx.as_ptr(),
+                    idx_offsets.as_ptr(),
+                    idx_numbers.as_ptr(),
+                    out.as_mut_ptr(),
+                    &mut out_len,
+                )
+            };
+            assert_eq!(
+                rc, 0,
+                "[{label} level {level}] C encode_full_cuesheet returned {rc}"
+            );
+            out.truncate(out_len);
+            assert_eq!(rust, out, "[{label} level {level}] CUESHEET stream differs");
+            let dec = libflac_rs::testing::decode(&rust).expect("decode");
+            assert_eq!(
+                dec.interleaved, pcm,
+                "[{label} level {level}] CUESHEET round-trip"
+            );
         }
     }
 }
