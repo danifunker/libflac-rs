@@ -257,10 +257,12 @@ with CRC-8/CRC-16 and MD5 verification. It decodes **complete streams the C
 reference produced** (`decode_libflac_streams`) and **round-trips the whole
 encoder corpus losslessly** (`decode(encode(pcm)) == pcm`) across 8/12/16/20/24/32-bit,
 mono+stereo, levels 0–8, with the embedded MD5 verifying. All restore math is
-`i64`, so the 33-bit side channel is exact. Steps 1–7 below are done; **remaining
-polish:** variable-block-size streams (`read_utf8_u64` sample numbers), a
-SEEKTABLE-driven `seek()` (needs Phase 8), and an incremental/streaming decode API
-(folds into Phase 11). The implementation record follows.
+`i64`, so the 33-bit side channel is exact. **SEEKTABLE-driven `seek()` is now done**
+(`decode_seek` — jump to the nearest seek point, then decode forward to the exact
+target sample; verified by exact-sample round-trips with and without a seektable).
+**Remaining polish:** variable-block-size streams (`read_utf8_u64` sample numbers)
+and an incremental/streaming decode API (folds into Phase 11). The implementation
+record follows.
 
 **Files (new):** `bitreader.rs`, `decoder.rs` (+ reuse `lpc::restore`,
 `fixed::restore`, `crc`, `md5`, `metadata` parsing).
@@ -297,8 +299,9 @@ SEEKTABLE-driven `seek()` (needs Phase 8), and an incremental/streaming decode A
    32-bit.
 6. **Verify** — frame **CRC-16**; accumulate decoded PCM and check **MD5** vs
    STREAMINFO at end-of-stream.
-7. **API + seeking** — a streaming decode (feed bytes → pull samples) and, later,
-   SEEKTABLE-driven `seek(sample)` (binary-search seekpoints, then frame-scan).
+7. **API + seeking** — SEEKTABLE-driven `seek(sample)` is **done** (`decode_seek`:
+   find the nearest seek point ≤ target, decode forward to the exact sample). A
+   streaming decode (feed bytes → pull samples) folds into Phase 11.
 
 **Verify (decisive):** (a) **round-trip** — `decode(encode(pcm)) == pcm` over the
 whole corpus and all configs; (b) decode files libFLAC produced and compare to

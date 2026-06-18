@@ -11,7 +11,7 @@
 use crate::bitreader::BitReader;
 use crate::crc::{crc8, crc16};
 use crate::frame::ChannelAssignment;
-use crate::metadata::SeekPoint;
+use crate::metadata::{SEEKPOINT_PLACEHOLDER, SeekPoint};
 
 /// Decoded audio frames.
 pub struct DecodedFrames {
@@ -75,10 +75,46 @@ pub struct DecodedStream {
 /// input or any CRC mismatch.
 pub fn decode(data: &[u8]) -> Option<DecodedStream> {
     let mut br = BitReader::new(data);
+    let (info, seek_points) = parse_header(&mut br)?;
+
+    let mut interleaved = Vec::new();
+    while br.byte_pos() < data.len() {
+        let frame = decode_frame(&mut br, data)?;
+        for i in 0..frame.blocksize {
+            for ch in &frame.samples {
+                interleaved.push(ch[i]);
+            }
+        }
+    }
+    // Trim any encoder padding beyond the declared length.
+    if info.total_samples > 0 {
+        interleaved.truncate(info.total_samples as usize * info.channels as usize);
+    }
+
+    let md5_ok = info.md5 == [0u8; 16] || {
+        let computed =
+            crate::md5::audio_md5(&interleaved, info.bits_per_sample.div_ceil(8) as usize);
+        computed == info.md5
+    };
+
+    Some(DecodedStream {
+        interleaved,
+        channels: info.channels,
+        bits_per_sample: info.bits_per_sample,
+        sample_rate: info.sample_rate,
+        total_samples: info.total_samples,
+        md5: info.md5,
+        md5_ok,
+        seek_points,
+    })
+}
+
+/// Parse the `fLaC` marker and the metadata blocks (interpreting STREAMINFO and
+/// SEEKTABLE, skipping the rest), leaving `br` positioned at the first audio frame.
+fn parse_header(br: &mut BitReader) -> Option<(StreamInfo, Vec<SeekPoint>)> {
     if br.read_raw_u32(32)? != 0x664c_6143 {
         return None; // "fLaC"
     }
-
     let mut info: Option<StreamInfo> = None;
     let mut seek_points: Vec<SeekPoint> = Vec::new();
     loop {
@@ -129,37 +165,83 @@ pub fn decode(data: &[u8]) -> Option<DecodedStream> {
             break;
         }
     }
-    let info = info?;
+    Some((info?, seek_points))
+}
 
-    let mut interleaved = Vec::new();
-    while br.byte_pos() < data.len() {
-        let frame = decode_frame(&mut br, data)?;
-        for i in 0..frame.blocksize {
-            for ch in &frame.samples {
-                interleaved.push(ch[i]);
-            }
+/// The result of a [`decode_seek`]: PCM from `first_sample` to the end of the
+/// stream.
+pub struct SeekResult {
+    /// Interleaved PCM starting at `first_sample`.
+    pub interleaved: Vec<i32>,
+    /// The first sample number the PCM begins at (the requested target).
+    pub first_sample: u64,
+    pub channels: u32,
+    pub bits_per_sample: u32,
+    pub sample_rate: u32,
+}
+
+/// The seek point to start decoding from for `target`: the non-placeholder point
+/// with the largest `sample_number` `<= target`, as `(sample_number, stream_offset)`
+/// relative to the first audio frame. Falls back to `(0, 0)` (the first frame) when
+/// no usable point exists. A linear scan — seektables are small.
+fn seek_start(seek_points: &[SeekPoint], target: u64) -> (u64, u64) {
+    let mut best = (0u64, 0u64);
+    for p in seek_points {
+        if p.sample_number != SEEKPOINT_PLACEHOLDER
+            && p.sample_number <= target
+            && p.sample_number >= best.0
+        {
+            best = (p.sample_number, p.stream_offset);
         }
     }
-    // Trim any encoder padding beyond the declared length.
-    if info.total_samples > 0 {
-        interleaved.truncate(info.total_samples as usize * info.channels as usize);
+    best
+}
+
+/// Decode a stream starting at `target_sample`, using the SEEKTABLE (if any) to jump
+/// near it before decoding forward. Returns the interleaved PCM from `target_sample`
+/// to the end of the stream. `None` on malformed input, a CRC mismatch, or
+/// `target_sample >= total_samples` (when the total is known). With no seektable it
+/// still works by decoding from the first frame.
+pub fn decode_seek(data: &[u8], target_sample: u64) -> Option<SeekResult> {
+    let mut br = BitReader::new(data);
+    let (info, seek_points) = parse_header(&mut br)?;
+    if info.total_samples != 0 && target_sample >= info.total_samples {
+        return None;
+    }
+    let audio_offset = br.byte_pos();
+
+    let (start_sample, start_offset) = seek_start(&seek_points, target_sample);
+    let start_byte = audio_offset.checked_add(start_offset as usize)?;
+    let frames = data.get(start_byte..)?;
+
+    let mut fbr = BitReader::new(frames);
+    let mut current = start_sample;
+    let mut interleaved = Vec::new();
+    while fbr.byte_pos() < frames.len() {
+        let frame = decode_frame(&mut fbr, frames)?;
+        let frame_end = current + frame.blocksize as u64;
+        // Emit only the part of this frame at or after the target sample.
+        if frame_end > target_sample {
+            let skip = target_sample.saturating_sub(current) as usize;
+            for i in skip..frame.blocksize {
+                for ch in &frame.samples {
+                    interleaved.push(ch[i]);
+                }
+            }
+        }
+        current = frame_end;
+    }
+    if info.total_samples != 0 {
+        let want = (info.total_samples - target_sample) as usize * info.channels as usize;
+        interleaved.truncate(want);
     }
 
-    let md5_ok = info.md5 == [0u8; 16] || {
-        let computed =
-            crate::md5::audio_md5(&interleaved, info.bits_per_sample.div_ceil(8) as usize);
-        computed == info.md5
-    };
-
-    Some(DecodedStream {
+    Some(SeekResult {
         interleaved,
+        first_sample: target_sample,
         channels: info.channels,
         bits_per_sample: info.bits_per_sample,
         sample_rate: info.sample_rate,
-        total_samples: info.total_samples,
-        md5: info.md5,
-        md5_ok,
-        seek_points,
     })
 }
 
@@ -435,8 +517,9 @@ fn sign_extend5(v: u32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, decode_frames};
-    use crate::encoder::{encode_frames, preset};
+    use super::{decode, decode_frames, decode_seek};
+    use crate::encoder::{encode, encode_frames, preset};
+    use crate::metadata::{LIBFLAC_VENDOR_STRING, MetadataBlock, spaced_seek_points};
 
     /// Multi-partial + noise PCM scaled to a `bps`-bit range, `channels` wide.
     fn gen_pcm(seed: u32, n: usize, bps: u32, channels: u32) -> Vec<i32> {
@@ -541,6 +624,61 @@ mod tests {
                     let dec = decode_frames(&frames).expect("decode failed");
                     assert_eq!(dec.interleaved, stereo, "[{name} bps {bps} level {level}]");
                 }
+            }
+        }
+    }
+
+    /// SEEKTABLE-driven `seek()`: a full stream with a spaced seektable, sought to a
+    /// range of targets (frame starts, mid-frame, the very end), must return PCM
+    /// that exactly matches the original from that sample onward. Also covers a
+    /// stream with *no* seektable (decode-from-start fallback).
+    #[test]
+    fn seek_lands_on_exact_sample() {
+        let bs = 2048u32;
+        let ch = 2u32;
+        for &bps in &[16u32, 24] {
+            let n = bs as usize * 5 + 777; // ~6 frames, short final
+            let total = n as u64;
+            let pcm = gen_pcm(5, n, bps, ch);
+            let with_seektable = spaced_seek_points(10, total);
+            let targets = [
+                0u64,
+                1,
+                bs as u64 - 1,
+                bs as u64,
+                bs as u64 + 5,
+                bs as u64 * 3 + 100,
+                total - bs as u64,
+                total - 10,
+                total - 1,
+            ];
+            // With and without a seektable (the latter exercises decode-from-start).
+            for seektable in [with_seektable.as_slice(), &[]] {
+                let blocks = [
+                    MetadataBlock::VorbisComment(LIBFLAC_VENDOR_STRING),
+                    MetadataBlock::Seektable(seektable),
+                ];
+                let nblocks = if seektable.is_empty() {
+                    &blocks[..1]
+                } else {
+                    &blocks[..]
+                };
+                let stream = encode(&pcm, ch, bps, 44_100, bs, &preset(8), true, nblocks);
+                for &target in &targets {
+                    let r = decode_seek(&stream, target).expect("seek");
+                    assert_eq!(r.first_sample, target);
+                    assert_eq!(r.channels, ch);
+                    assert_eq!(r.bits_per_sample, bps);
+                    let expected = &pcm[target as usize * ch as usize..];
+                    assert_eq!(
+                        r.interleaved,
+                        expected,
+                        "[bps {bps} seektable {}] seek to {target}",
+                        !seektable.is_empty()
+                    );
+                }
+                // Seeking at/after the end is rejected.
+                assert!(decode_seek(&stream, total).is_none());
             }
         }
     }
