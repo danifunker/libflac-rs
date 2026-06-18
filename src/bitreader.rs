@@ -22,11 +22,6 @@ impl<'a> BitReader<'a> {
         Self { data, pos: 0 }
     }
 
-    /// Total bits consumed so far.
-    pub fn bit_pos(&self) -> usize {
-        self.pos
-    }
-
     /// Current byte offset (only meaningful when byte-aligned).
     pub fn byte_pos(&self) -> usize {
         self.pos / 8

@@ -192,9 +192,14 @@ diffing at the first mismatching field to localize float drift.
   `do_mid_side = -1`) across the decorrelated-noise corpus and crafted
   identical/anti/scaled/independent L-R cases. **The first target (CHD/MAME
   config) is now complete end-to-end.**
-- **F4** Public API, docs, CI (vendor a libFLAC subset for self-contained CI),
-  publish. Optionally the CD subcode-split + `'L'`/`'B'` endian-trial wrapper, or
-  leave that to chd-rs.
+- **F4 — DONE (public API + docs).** The crate-root surface
+  (`Encoder`/`EncoderConfig`, the `decode*` free fns + `Decoded*`/`SeekResult`, and
+  the `metadata` types) with crate-level + per-type docs and doctests; the blanket
+  `#![allow(dead_code)]` is gone (only two targeted allows on faithful bit-writer
+  mirrors). CI vendors libFLAC + libogg for a self-contained differential build;
+  `cargo publish --dry-run` produces a slim, leak-free pure-Rust tarball. The
+  crates.io release itself is a maintainer dispatch (`publish-crates-io.yml`). The
+  CD subcode-split + `'L'`/`'B'` endian-trial wrapper stays in chd-rs.
 
 ### Generalization (beyond the CHD slice)
 

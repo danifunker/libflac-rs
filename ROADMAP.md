@@ -9,10 +9,11 @@ reference to port, the data shapes, the bit-exactness traps, and how to verify.
 config** and has generalized to **all levels (0–8)**, **bit depths 8/12/16/20/24**,
 and **complete `.flac` files** at **every standard bit depth (8–32)** — and a
 **decoder** that losslessly round-trips the encoder and reads real libFLAC output
-(MD5-verified). Phases **0–10 are DONE** — full metadata (incl. SEEKTABLE +
-CUESHEET), a complete decoder with `seek()` and variable-block-size support, and
-**byte-exact Ogg FLAC** (encode + decode) verified against libFLAC+libogg; remaining:
-the public API + publish (Phase 11, which also absorbs the streaming decode API).
+(MD5-verified). Phases **0–11 are DONE** — full metadata (incl. SEEKTABLE +
+CUESHEET), a complete decoder with `seek()` and variable-block-size support,
+**byte-exact Ogg FLAC** (encode + decode) verified against libFLAC+libogg, and a
+documented, zero-dependency **public API** (`Encoder`/`EncoderConfig` + `decode*`).
+All that remains is dispatching the crates.io release (a maintainer action).
 
 ```
 DONE   Phase 0  Bitwriter + CRC                      █████████
@@ -28,7 +29,8 @@ DONE   Phase 8  Metadata: APPLICATION + PICTURE +     ████████�
 DONE   Phase 9  The decoder: round-trips, reads real  █████████
                  libFLAC, seek() + variable blocksize
 DONE   Phase 10 Ogg FLAC (byte-exact vs libogg)       █████████
-TODO   Phase 11 Public API, docs, publish            ░░░░░░░░░
+DONE*  Phase 11 Public API + docs (release dispatch   ████████░
+                 is the only step left)
 ```
 
 ### How to verify any phase (the rule that governs all work)
@@ -350,31 +352,37 @@ fixed serial number; `ogg_stream_matches_c` diffs full streams and
 
 ---
 
-# TODO — Phase 11: public API, docs, publish
+# DONE* — Phase 11: public API, docs, publish (code ready; release dispatch left)
 
-**Goal:** a stable, ergonomic public surface; ship the crate.
+**Status: the public API, docs, and packaging are done; only the actual crates.io
+release dispatch remains** (a maintainer action — tag + run the publish workflow).
 
-**Files:** `lib.rs`, new `encoder`/`decoder` public wrappers, `Cargo.toml`, CI.
-
-### Tasks
-1. **Public encoder API** — a config struct, not long arg lists; drop
-   `#![allow(dead_code)]` and the `testing`-only gating for the real surface:
+1. **Public API — DONE.** A crate-root surface, no more `#![allow(dead_code)]`
+   blanket (only two targeted allows on faithful bit-writer mirror methods):
    ```rust
-   pub struct Encoder { /* level, channels, bps, sample_rate, blocksize, mid_side… */ }
+   pub struct EncoderConfig { channels, bits_per_sample, sample_rate, block_size,
+                              compression_level, md5 }
+   impl EncoderConfig { fn new(ch, bps, rate); fn chd(block_size); with_* builders }
+   pub struct Encoder(EncoderConfig);
    impl Encoder {
-       pub fn new_chd(block_size: u32) -> Self;            // 2ch/16-bit/44.1k, level 8, subset off
-       pub fn with_config(cfg: EncoderConfig) -> Self;
-       pub fn encode_interleaved(&mut self, samples: &[i32]) -> Vec<u8>; // raw frames
-       pub fn finish(self) -> Vec<u8>;                     // full file (marker+metadata+frames)
+       fn encode(&self, &[i32]) -> Vec<u8>;                  // full .flac (default VC)
+       fn encode_with_metadata(&self, &[i32], &[MetadataBlock]) -> Vec<u8>;
+       fn encode_frames(&self, &[i32]) -> Vec<u8>;           // raw frames (CHD)
+       fn encode_ogg(&self, &[i32], serial: i32) -> Vec<u8>; // Ogg FLAC
    }
-   pub struct Decoder { /* … */ }                          // streaming decode + seek
+   // free fns: decode, decode_frames, decode_ogg, decode_seek -> Decoded{Stream,Frames}/SeekResult
+   // metadata: MetadataBlock, SeekPoint, CueSheetTrack/Index, LIBFLAC_VENDOR_STRING, spaced_seek_points
    ```
-2. **Docs** — crate-level guide, per-type docs, a worked example; keep the
-   `*.c:NNN` citations in module docs accurate.
-3. **CI / packaging** — keep the pure-Rust matrix (Linux/Windows/macOS) + the
-   Linux/glibc differential + lint; `#![forbid(unsafe_code)]`, edition 2024,
-   MSRV 1.85, **zero runtime deps**; exclude `cref/`, `build.rs`, vendored C from
-   the package; semver `0.143.x`; `cargo publish`.
+   (One-shot, not a streaming push/pull — sufficient for the CHD use case; a
+   streaming API can be added later, additively.)
+2. **Docs — DONE.** Crate-level guide with worked encode/decode examples (3
+   doctests), per-type docs; module `*.c:NNN` citations kept accurate.
+3. **CI / packaging — DONE.** Pure-Rust matrix (Linux/Windows/macOS) + Linux/glibc
+   differential + lint (fmt/clippy/doc); `#![forbid(unsafe_code)]`, edition 2024,
+   MSRV 1.85, **zero runtime deps**; `cref/` + `build.rs` + vendored C excluded from
+   the package (verified: `cargo publish --dry-run` builds the slim tarball — 30
+   files, no leaks). The `publish-crates-io.yml` workflow (tag + dispatch, needs
+   `CARGO_REGISTRY_TOKEN`) does the release; **not yet dispatched.**
 4. **CHD glue stays in `chd-rs`** — the `'L'`/`'B'` endian-flag byte + both-endian
    trial (raw `flac` codec) and the audio→FLAC / subcode→deflate split (`cdfl`)
    wrap this crate; out of scope here.

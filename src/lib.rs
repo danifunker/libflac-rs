@@ -1,29 +1,49 @@
-//! A pure-Rust port of the **libFLAC 1.4.3** encoder, built to produce frame
-//! output **byte-identical** to the C reference at the configuration CHD/MAME
-//! uses: compression level 8, 2-channel / 16-bit / 44.1 kHz, streamable subset
-//! off, MD5 off, explicit block size (typically 2048).
+//! `libflac-rs` — a pure-Rust, **bit-exact** port of **libFLAC 1.4.3**: a complete
+//! FLAC **encoder and decoder** whose output is byte-identical to the C reference.
 //!
-//! This is bit-exactness-first work: a "working" encoder that emits valid FLAC is
-//! **not** the goal if it differs from the C output by a single byte. The crate
-//! is continuously differential-tested against the real libFLAC, compiled from
-//! source as a dev-only oracle (the `cref` feature) — see `CLAUDE.md` and
-//! `ROADMAP.md` for the milestone status.
+//! It exists for consumers that must *recreate* the exact bytes libFLAC/MAME produce
+//! (e.g. `chd-rs` reproducing MAME CHD audio), not merely emit valid FLAC — every
+//! encoded byte is continuously differential-tested against the real libFLAC (and
+//! libogg, for Ogg), compiled from source as a dev-only oracle.
 //!
-//! The library itself is pure Rust with zero runtime dependencies; the C
-//! reference is only ever compiled as a test oracle and is excluded from the
-//! published crate, so consumers (e.g. `chd-rs`) get a dependency-free library.
+//! # What's supported
+//! - **Encoder**, byte-identical to libFLAC: all compression levels 0–8, all bit
+//!   depths (8/12/16/20/24/32), mono / stereo (with mid-side decorrelation) /
+//!   multichannel, every metadata block (STREAMINFO, VORBIS_COMMENT, PADDING,
+//!   APPLICATION, SEEKTABLE, PICTURE, CUESHEET), and the audio MD5.
+//! - **Decoder**: lossless and MD5-verified, with [`decode_seek`] and
+//!   variable-block-size support.
+//! - **Ogg FLAC** ([`Encoder::encode_ogg`] / [`decode_ogg`]), byte-identical to
+//!   libFLAC + libogg.
+//! - Pure Rust, `#![forbid(unsafe_code)]`, **zero runtime dependencies**.
+//!
+//! # Encoding
+//! ```
+//! use libflac_rs::{Encoder, EncoderConfig};
+//!
+//! // 2-channel, 16-bit, 44.1 kHz, compression level 8 (libFLAC's defaults).
+//! let enc = Encoder::new(EncoderConfig::new(2, 16, 44_100));
+//! let pcm: Vec<i32> = vec![0; 4096 * 2]; // interleaved: L R L R …
+//! let flac: Vec<u8> = enc.encode(&pcm);  // a complete .flac file
+//! assert_eq!(&flac[..4], b"fLaC");
+//! ```
+//! For the raw frame stream MAME/CHD embeds, use [`EncoderConfig::chd`] with
+//! [`Encoder::encode_frames`]; for Ogg FLAC, [`Encoder::encode_ogg`].
+//!
+//! # Decoding
+//! ```
+//! # use libflac_rs::{Encoder, EncoderConfig};
+//! # let enc = Encoder::new(EncoderConfig::new(2, 16, 44_100));
+//! # let pcm: Vec<i32> = vec![7; 4096 * 2];
+//! # let flac = enc.encode(&pcm);
+//! let decoded = libflac_rs::decode(&flac).expect("valid FLAC");
+//! assert_eq!(decoded.interleaved, pcm);
+//! assert!(decoded.md5_ok);
+//! ```
+//!
+//! See `ROADMAP.md` for the bit-exactness methodology and milestone history.
 
 #![forbid(unsafe_code)]
-// Scaffolding while the encoder is built up milestone by milestone; removed at F4
-// once `encoder` wires everything into the public API.
-#![allow(dead_code)]
-
-// Modules are added milestone by milestone:
-//   F0  bitwriter + crc            (bit packing, CRC-8/CRC-16)
-//   F1  fixed + subframe + frame   (CONSTANT/VERBATIM/FIXED, header/footer)
-//   F2  window + lpc/* + bitmath   (the LPC float-parity gate)
-//   F3  mid-side                   (channel assignment by estimated bits)
-//   F4  encoder                    (public API, level-8 preset wiring)
 
 mod bitmath;
 mod bitreader;
@@ -41,6 +61,15 @@ mod ogg;
 mod rice;
 mod subframe;
 mod window;
+
+pub use decoder::{
+    DecodedFrames, DecodedStream, SeekResult, decode, decode_frames, decode_ogg, decode_seek,
+};
+pub use encoder::{Encoder, EncoderConfig};
+pub use metadata::{
+    CueSheetIndex, CueSheetTrack, LIBFLAC_VENDOR_STRING, MetadataBlock, SeekPoint,
+    spaced_seek_points,
+};
 
 /// Internals exposed **only** for the differential tests (`--features cref`). Not
 /// part of the public API and carries no stability guarantee; absent from the

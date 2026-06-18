@@ -1049,3 +1049,173 @@ pub fn encode_ogg(
 
     og.into_bytes()
 }
+
+/// Audio format and compression settings for an [`Encoder`].
+///
+/// Build one with [`EncoderConfig::new`] (libFLAC's defaults: compression level 8,
+/// 4096-sample blocks, MD5 on) or [`EncoderConfig::chd`] (MAME/CHD's exact
+/// configuration), then adjust with the `with_*` methods if needed.
+#[derive(Clone, Copy, Debug)]
+pub struct EncoderConfig {
+    /// Number of channels, 1–8. Stereo (2) enables mid/side decorrelation.
+    pub channels: u32,
+    /// Bits per sample: 8, 12, 16, 20, 24, or 32.
+    pub bits_per_sample: u32,
+    /// Sample rate in Hz.
+    pub sample_rate: u32,
+    /// Fixed block size in samples (the final frame may be shorter). libFLAC's
+    /// default is 4096; CHD uses 2048.
+    pub block_size: u32,
+    /// Compression preset, 0 (fastest) … 8 (smallest); values above 8 clamp to 8.
+    pub compression_level: u32,
+    /// Whether STREAMINFO carries the audio MD5 signature (libFLAC's `--no-md5-sum`,
+    /// and CHD, set this `false`).
+    pub md5: bool,
+}
+
+impl EncoderConfig {
+    /// A config for the given format at libFLAC's defaults: compression level 8,
+    /// 4096-sample blocks, MD5 enabled.
+    pub fn new(channels: u32, bits_per_sample: u32, sample_rate: u32) -> Self {
+        Self {
+            channels,
+            bits_per_sample,
+            sample_rate,
+            block_size: 4096,
+            compression_level: 8,
+            md5: true,
+        }
+    }
+
+    /// The exact configuration MAME/CHD uses: 2-channel / 16-bit / 44.1 kHz,
+    /// compression level 8, MD5 **off**, and the given fixed `block_size` (CHD
+    /// typically uses 2048). Pair with [`Encoder::encode_frames`] for the raw frame
+    /// bytes CHD embeds.
+    pub fn chd(block_size: u32) -> Self {
+        Self {
+            channels: 2,
+            bits_per_sample: 16,
+            sample_rate: 44_100,
+            block_size,
+            compression_level: 8,
+            md5: false,
+        }
+    }
+
+    /// Set the compression level (0–8).
+    pub fn with_compression_level(mut self, level: u32) -> Self {
+        self.compression_level = level;
+        self
+    }
+    /// Set the fixed block size in samples.
+    pub fn with_block_size(mut self, block_size: u32) -> Self {
+        self.block_size = block_size;
+        self
+    }
+    /// Set whether STREAMINFO carries the audio MD5.
+    pub fn with_md5(mut self, md5: bool) -> Self {
+        self.md5 = md5;
+        self
+    }
+}
+
+/// A one-shot FLAC encoder, byte-identical to libFLAC 1.4.3 at the same settings.
+///
+/// Each `encode*` method takes the **entire** interleaved signal (channel-major
+/// within a sample — `L R L R …` for stereo, each value a sign-extended `i32`) and
+/// returns the encoded bytes.
+///
+/// ```
+/// use libflac_rs::{Encoder, EncoderConfig};
+///
+/// let enc = Encoder::new(EncoderConfig::new(2, 16, 44_100));
+/// let pcm = vec![0i32; 4096 * 2]; // one block of stereo silence, interleaved
+/// let flac = enc.encode(&pcm);    // a complete .flac file
+/// assert_eq!(&flac[..4], b"fLaC");
+/// ```
+pub struct Encoder {
+    config: EncoderConfig,
+    inner: Config,
+}
+
+impl Encoder {
+    /// Create an encoder from `config`.
+    pub fn new(config: EncoderConfig) -> Self {
+        let inner = preset(config.compression_level);
+        Self { config, inner }
+    }
+
+    /// The configuration this encoder was built with.
+    pub fn config(&self) -> &EncoderConfig {
+        &self.config
+    }
+
+    /// Encode to **raw FLAC frames** — no `fLaC` marker or metadata — the byte stream
+    /// MAME/CHD embeds. (The `md5` setting has no effect here: MD5 lives in
+    /// STREAMINFO, which raw frames omit.)
+    pub fn encode_frames(&self, interleaved: &[i32]) -> Vec<u8> {
+        encode_frames(
+            interleaved,
+            self.config.channels,
+            self.config.bits_per_sample,
+            self.config.sample_rate,
+            self.config.block_size,
+            &self.inner,
+        )
+    }
+
+    /// Encode to a complete `.flac` file (the `fLaC` marker, STREAMINFO, libFLAC's
+    /// default VORBIS_COMMENT, then the frames) — byte-identical to libFLAC's default
+    /// output. Use [`Encoder::encode_with_metadata`] to control the metadata.
+    pub fn encode(&self, interleaved: &[i32]) -> Vec<u8> {
+        self.encode_with_metadata(
+            interleaved,
+            &[metadata::MetadataBlock::VorbisComment(
+                metadata::LIBFLAC_VENDOR_STRING,
+            )],
+        )
+    }
+
+    /// Encode to a complete `.flac` file with the given metadata `blocks`, written
+    /// after STREAMINFO in order (the last automatically carries the
+    /// end-of-metadata flag). To match libFLAC's output, put a
+    /// [`MetadataBlock::VorbisComment`](crate::MetadataBlock::VorbisComment) with
+    /// [`LIBFLAC_VENDOR_STRING`](crate::LIBFLAC_VENDOR_STRING) first. A
+    /// [`MetadataBlock::Seektable`](crate::MetadataBlock::Seektable) is filled in
+    /// during encoding.
+    pub fn encode_with_metadata(
+        &self,
+        interleaved: &[i32],
+        blocks: &[metadata::MetadataBlock],
+    ) -> Vec<u8> {
+        encode(
+            interleaved,
+            self.config.channels,
+            self.config.bits_per_sample,
+            self.config.sample_rate,
+            self.config.block_size,
+            &self.inner,
+            self.config.md5,
+            blocks,
+        )
+    }
+
+    /// Encode to a complete **Ogg FLAC** stream with the given Ogg logical-bitstream
+    /// `serial` number. libFLAC's default VORBIS_COMMENT is included; any SEEKTABLE is
+    /// dropped (as libFLAC does for Ogg).
+    pub fn encode_ogg(&self, interleaved: &[i32], serial: i32) -> Vec<u8> {
+        encode_ogg(
+            interleaved,
+            self.config.channels,
+            self.config.bits_per_sample,
+            self.config.sample_rate,
+            self.config.block_size,
+            &self.inner,
+            self.config.md5,
+            &[metadata::MetadataBlock::VorbisComment(
+                metadata::LIBFLAC_VENDOR_STRING,
+            )],
+            serial,
+        )
+    }
+}

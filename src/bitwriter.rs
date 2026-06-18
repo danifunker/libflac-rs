@@ -25,15 +25,9 @@ impl BitWriter {
         Self::default()
     }
 
-    pub fn with_capacity(bytes: usize) -> Self {
-        Self {
-            buf: Vec::with_capacity(bytes),
-            accum: 0,
-            nbits: 0,
-        }
-    }
-
     /// Total bits written so far (`FLAC__bitwriter_get_input_bits_unconsumed`).
+    /// Part of the faithful bit-writer mirror; exercised by the unit tests.
+    #[allow(dead_code)]
     pub fn len_bits(&self) -> usize {
         self.buf.len() * 8 + self.nbits as usize
     }
@@ -183,6 +177,9 @@ impl BitWriter {
     /// UTF-8-style coding of a 36-bit value (`FLAC__bitwriter_write_utf8_uint64`),
     /// used for the sample number in a variable-block-size stream. Extends the 6-byte
     /// UTF-8 form with a 7-byte form (`0xFE` lead, no value bits) for 32–36 bits.
+    /// The encoder only emits fixed block size, so this mirror is currently used just
+    /// by the decoder's variable-block-size tests.
+    #[allow(dead_code)]
     pub fn write_utf8_u64(&mut self, val: u64) {
         debug_assert_eq!(
             val & 0xFFFF_FFF0_0000_0000,
