@@ -53,20 +53,31 @@ fn main() {
     // Expose the C tree to the tests (used as a source of real PCM-like data).
     println!("cargo:rustc-env=FLAC_C_DIR={}", flac.display());
 
+    // Vendored libogg (`cref/vendor/ogg`), so the oracle can be built with Ogg
+    // support for the Ogg-FLAC differential tests. libFLAC delegates all Ogg paging
+    // to libogg, so a byte-exact Ogg oracle needs it. Dev-only (cref/ is excluded
+    // from the published crate, which stays pure-Rust).
+    let ogg = manifest.join("cref").join("vendor").join("ogg");
+
     let mut build = cc::Build::new();
     build
         .include(flac.join("include")) // FLAC/*.h, share/*.h
         .include(libflac.join("include")) // private/*.h, protected/*.h, config.h
+        .include(ogg.join("include")) // <ogg/ogg.h>, <ogg/os_types.h>
         // Mirror MAME's libFLAC define set (scripts/src/3rdparty.lua) so the oracle
         // matches chdman's macro environment exactly, then force the *scalar*
         // reference path with FLAC__NO_ASM (the `#ifndef FLAC__NO_ASM` dispatch in
         // stream_encoder.c is skipped, so no intrin symbols are referenced even
         // though config.h sets FLAC__HAS_X86INTRIN=1). config.h supplies the CPU
         // macros + PACKAGE_VERSION; release semantics via NDEBUG.
+        //
+        // FLAC__HAS_OGG=1 enables the Ogg path; it is fully runtime-gated on the
+        // encoder's `is_ogg` flag, so native (non-Ogg) output is byte-identical to a
+        // HAS_OGG=0 build — the existing differential tests confirm this.
         .define("HAVE_CONFIG_H", None)
         .define("FLAC__NO_ASM", None)
-        .define("FLAC__HAS_OGG", "0")
-        .define("OGG_FOUND", "0")
+        .define("FLAC__HAS_OGG", "1")
+        .define("OGG_FOUND", "1")
         .define("NDEBUG", None)
         .define("HAVE_LROUND", "1")
         .define("ENABLE_64_BIT_WORDS", "1")
@@ -79,8 +90,8 @@ fn main() {
         .warnings(false);
 
     // libFLAC encoder + the verify decoder it links (verify is off at runtime,
-    // but the symbols are referenced). All *_intrin_* / *_asm_* and ogg/metadata
-    // translation units are intentionally omitted.
+    // but the symbols are referenced), plus the Ogg layer (HAS_OGG=1). All
+    // *_intrin_* / *_asm_* and metadata-object translation units are omitted.
     for f in [
         "stream_encoder.c",
         "stream_encoder_framing.c",
@@ -97,8 +108,20 @@ fn main() {
         "cpu.c",
         "stream_decoder.c",
         "bitreader.c",
+        // Ogg layer: the encoder/decoder "aspects" that drive libogg, the metadata
+        // rewrite helper, and the FLAC-in-Ogg mapping constants.
+        "ogg_encoder_aspect.c",
+        "ogg_decoder_aspect.c",
+        "ogg_helper.c",
+        "ogg_mapping.c",
     ] {
         build.file(libflac.join(f));
+    }
+    // Vendored libogg (the actual page framing + bit I/O). Its sources `#include
+    // "config.h"` under HAVE_CONFIG_H; a local stub in the same dir shadows
+    // libFLAC's via quote-include resolution.
+    for f in ["framing.c", "bitwise.c"] {
+        build.file(ogg.join("src").join(f));
     }
     build.file(manifest.join("cref").join("shim.c"));
 

@@ -245,6 +245,67 @@ pub fn decode_seek(data: &[u8], target_sample: u64) -> Option<SeekResult> {
     })
 }
 
+/// Decode a complete **Ogg FLAC** stream: `OggS` pages → FLAC packets → PCM. Parses
+/// the BOS mapping packet (`0x7F"FLAC"` + version + header count + `"fLaC"` +
+/// STREAMINFO), concatenates the audio-frame packets, and decodes them, verifying the
+/// audio MD5 against STREAMINFO. `None` on malformed Ogg (a bad page CRC or missing
+/// mapping) or any frame CRC mismatch. (Ogg FLAC carries no seektable, so
+/// `seek_points` is empty.)
+pub fn decode_ogg(data: &[u8]) -> Option<DecodedStream> {
+    let packets = crate::ogg::read_packets(data)?;
+    let bos = packets.first()?;
+    // BOS layout: 0x7F | "FLAC" | maj | min | num_headers(2) | "fLaC" | STREAMINFO(38)
+    if bos.len() < 13 + 38 || bos[0] != 0x7F || &bos[1..5] != b"FLAC" || &bos[9..13] != b"fLaC" {
+        return None;
+    }
+    let mut sbr = BitReader::new(&bos[13..]);
+    let _is_last = sbr.read_raw_u32(1)?;
+    if sbr.read_raw_u32(7)? != 0 {
+        return None; // first metadata block must be STREAMINFO
+    }
+    let _len = sbr.read_raw_u32(24)?;
+    let _min_bs = sbr.read_raw_u32(16)?;
+    let _max_bs = sbr.read_raw_u32(16)?;
+    let _min_fs = sbr.read_raw_u32(24)?;
+    let _max_fs = sbr.read_raw_u32(24)?;
+    let sample_rate = sbr.read_raw_u32(20)?;
+    let channels = sbr.read_raw_u32(3)? + 1;
+    let bits_per_sample = sbr.read_raw_u32(5)? + 1;
+    let total_samples = sbr.read_raw_u64(36)?;
+    let mut md5 = [0u8; 16];
+    for b in &mut md5 {
+        *b = sbr.read_raw_u32(8)? as u8;
+    }
+
+    // Audio frames are the packets from the first one with a 0x3FFE sync (high byte
+    // 0xFF); the metadata packets (VORBIS_COMMENT, etc.) precede them.
+    let mut frame_bytes = Vec::new();
+    if let Some(idx) = packets[1..].iter().position(|p| p.first() == Some(&0xFF)) {
+        for p in &packets[1 + idx..] {
+            frame_bytes.extend_from_slice(p);
+        }
+    }
+    let decoded = decode_frames(&frame_bytes)?;
+    let mut interleaved = decoded.interleaved;
+    if total_samples > 0 {
+        interleaved.truncate(total_samples as usize * channels as usize);
+    }
+    let md5_ok = md5 == [0u8; 16] || {
+        crate::md5::audio_md5(&interleaved, bits_per_sample.div_ceil(8) as usize) == md5
+    };
+
+    Some(DecodedStream {
+        interleaved,
+        channels,
+        bits_per_sample,
+        sample_rate,
+        total_samples,
+        md5,
+        md5_ok,
+        seek_points: Vec::new(),
+    })
+}
+
 struct StreamInfo {
     sample_rate: u32,
     channels: u32,
@@ -525,9 +586,9 @@ fn sign_extend5(v: u32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, decode_frames, decode_seek};
+    use super::{decode, decode_frames, decode_ogg, decode_seek};
     use crate::bitwriter::BitWriter;
-    use crate::encoder::{encode, encode_frames, preset};
+    use crate::encoder::{encode, encode_frames, encode_ogg, preset};
     use crate::metadata::{LIBFLAC_VENDOR_STRING, MetadataBlock, spaced_seek_points};
 
     /// Multi-partial + noise PCM scaled to a `bps`-bit range, `channels` wide.
@@ -724,5 +785,37 @@ mod tests {
         assert_eq!(dec.bits_per_sample, 16);
         assert_eq!(dec.sample_rate, 44_100);
         assert_eq!(dec.interleaved, vec![1000i32; 4]);
+    }
+
+    /// Ogg FLAC round-trip: `encode_ogg` → `decode_ogg` reproduces the PCM exactly
+    /// (with the embedded MD5 verifying), across all depths incl. 32-bit. The
+    /// byte-exactness of `encode_ogg` vs libFLAC is covered by the `cref` tests; this
+    /// exercises the pure-Rust page demux + FLAC demap with no oracle.
+    #[test]
+    fn ogg_round_trip() {
+        for &bps in &[8u32, 16, 20, 24, 32] {
+            for level in [0u32, 5, 8] {
+                // Non-block-multiple length → a short final frame.
+                let pcm = gen_pcm(7, 12_000 + bps as usize * 13, bps, 2);
+                let ogg = encode_ogg(
+                    &pcm,
+                    2,
+                    bps,
+                    44_100,
+                    4096,
+                    &preset(level),
+                    true,
+                    &[MetadataBlock::VorbisComment(LIBFLAC_VENDOR_STRING)],
+                    0x55AA_1234,
+                );
+                let dec = decode_ogg(&ogg).expect("decode_ogg");
+                assert_eq!(
+                    dec.interleaved, pcm,
+                    "[bps {bps} level {level}] ogg round-trip"
+                );
+                assert!(dec.md5_ok, "[bps {bps} level {level}] ogg MD5");
+                assert_eq!(dec.total_samples, (pcm.len() / 2) as u64);
+            }
+        }
     }
 }

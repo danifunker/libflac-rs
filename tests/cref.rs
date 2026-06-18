@@ -51,6 +51,20 @@ unsafe extern "C" {
         out: *mut u8,
         out_len: *mut usize,
     ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    fn libflac_rs_cref_encode_ogg(
+        interleaved: *const i32,
+        nsamples: u32,
+        channels: u32,
+        bps: u32,
+        sample_rate: u32,
+        blocksize: u32,
+        compression_level: i32,
+        do_md5: i32,
+        serial_number: i32,
+        out: *mut u8,
+        out_len: *mut usize,
+    ) -> c_int;
     fn libflac_rs_cref_decode(
         data: *const u8,
         len: usize,
@@ -1769,6 +1783,93 @@ fn cuesheet_metadata_matches_c() {
                 dec.interleaved, pcm,
                 "[{label} level {level}] CUESHEET round-trip"
             );
+        }
+    }
+}
+
+fn c_encode_ogg(interleaved: &[i32], bps: u32, blocksize: u32, level: i32, serial: i32) -> Vec<u8> {
+    let mut out = vec![0u8; interleaved.len() * 4 + 16384];
+    let mut out_len = out.len();
+    let rc = unsafe {
+        libflac_rs_cref_encode_ogg(
+            interleaved.as_ptr(),
+            (interleaved.len() / 2) as u32,
+            2,
+            bps,
+            44_100,
+            blocksize,
+            level,
+            1,
+            serial,
+            out.as_mut_ptr(),
+            &mut out_len,
+        )
+    };
+    assert_eq!(rc, 0, "C encode_ogg returned {rc}");
+    out.truncate(out_len);
+    out
+}
+
+/// Phase 10: Ogg FLAC. The Rust `encode_ogg` output must be byte-identical to
+/// libFLAC+libogg (the oracle is built with FLAC__HAS_OGG=1). Covers small (single
+/// EOS-flushed audio page) and large (multiple nominal audio pages) signals at a few
+/// levels; libFLAC auto-inserts its default VORBIS_COMMENT, so the Rust block list is
+/// just that. A fixed serial number makes both sides deterministic.
+#[test]
+fn ogg_stream_matches_c() {
+    let vendor = libflac_rs::testing::LIBFLAC_VENDOR_STRING;
+    let serial = 0x1234_5678i32;
+    // Sizes spanning a single EOS-flushed audio page and many nominal pages; depths
+    // covering RICE (8-bit) and RICE2 (24-bit) frames.
+    for &(n, bs) in &[(5000usize, 4096u32), (60_000, 4096), (33_333, 2048)] {
+        for &bps in &[8u32, 16, 24] {
+            for level in [0u32, 5, 8] {
+                let pcm = gen_pcm_bps(1, n, bps);
+                let rust = libflac_rs::testing::encode_ogg(
+                    &pcm,
+                    2,
+                    bps,
+                    44_100,
+                    bs,
+                    &libflac_rs::testing::preset(level),
+                    true,
+                    &[MetadataBlock::VorbisComment(vendor)],
+                    serial,
+                );
+                let c = c_encode_ogg(&pcm, bps, bs, level as i32, serial);
+                if rust != c {
+                    let first = (0..rust.len().min(c.len()))
+                        .find(|&i| rust[i] != c[i])
+                        .unwrap_or(rust.len().min(c.len()));
+                    let lo = first.saturating_sub(6);
+                    panic!(
+                        "[n {n} bs {bs} bps {bps} level {level}] Ogg differs: rust.len={} c.len={} first@{first}\n  rust={:02x?}\n  c   ={:02x?}",
+                        rust.len(),
+                        c.len(),
+                        &rust[lo..(first + 20).min(rust.len())],
+                        &c[lo..(first + 20).min(c.len())],
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Decode **real libFLAC Ogg output** back to PCM: encode via the oracle, decode with
+/// our `decode_ogg`, and confirm the samples and embedded MD5 round-trip — across bit
+/// depths. Proves Ogg page demux + FLAC demap + frame decode against the C reference.
+#[test]
+fn decode_ogg_libflac_streams() {
+    for &bps in &[8u32, 16, 20, 24] {
+        for level in [0u32, 8] {
+            let pcm = gen_pcm_bps(2, 40_000, bps);
+            let c = c_encode_ogg(&pcm, bps, 4096, level as i32, 0x0BAD_F00D_u32 as i32);
+            let dec = libflac_rs::testing::decode_ogg(&c).expect("decode_ogg");
+            assert_eq!(dec.channels, 2, "[bps {bps} level {level}]");
+            assert_eq!(dec.bits_per_sample, bps);
+            assert_eq!(dec.total_samples, (pcm.len() / 2) as u64);
+            assert!(dec.md5_ok, "[bps {bps} level {level}] Ogg MD5");
+            assert_eq!(dec.interleaved, pcm, "[bps {bps} level {level}] Ogg PCM");
         }
     }
 }

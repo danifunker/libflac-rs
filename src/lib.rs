@@ -37,6 +37,7 @@ mod frame;
 mod lpc;
 mod md5;
 mod metadata;
+mod ogg;
 mod rice;
 mod subframe;
 mod window;
@@ -50,9 +51,9 @@ pub mod testing {
     pub use crate::bitwriter::BitWriter;
     pub use crate::crc::{crc8, crc16};
     pub use crate::decoder::{
-        DecodedFrames, DecodedStream, SeekResult, decode, decode_frames, decode_seek,
+        DecodedFrames, DecodedStream, SeekResult, decode, decode_frames, decode_ogg, decode_seek,
     };
-    pub use crate::encoder::{Apodization, Config, encode, encode_frames, preset};
+    pub use crate::encoder::{Apodization, Config, encode, encode_frames, encode_ogg, preset};
     pub use crate::md5::audio_md5;
     pub use crate::metadata::{
         CueSheetIndex, CueSheetTrack, LIBFLAC_VENDOR_STRING, MetadataBlock, SeekPoint,

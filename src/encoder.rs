@@ -17,7 +17,7 @@ use crate::format::{
     MAX_QLP_COEFF_PRECISION, MIN_QLP_COEFF_PRECISION,
 };
 use crate::frame::{ChannelAssignment, FrameHeader, write_frame_footer, write_frame_header};
-use crate::{fixed, lpc, metadata, rice, subframe, window};
+use crate::{fixed, lpc, metadata, ogg, rice, subframe, window};
 
 /// Minimum residual partition order (0 for every compression level).
 const MIN_RESIDUAL_PARTITION_ORDER: u32 = 0;
@@ -594,6 +594,7 @@ pub fn encode_frames(
         blocksize,
         config,
         None,
+        None,
     )
     .0
 }
@@ -602,7 +603,10 @@ pub fn encode_frames(
 /// STREAMINFO). `min_framesize` is 0 if no frames were produced. When `seektable`
 /// is `Some`, it is a SEEKTABLE *template* (sorted target sample numbers) filled in
 /// place as frames go by, then sorted/uniquified at finish — exactly as libFLAC
-/// generates a seektable during encoding.
+/// generates a seektable during encoding. When `frame_lengths` is `Some`, each
+/// frame's byte length is appended (so the Ogg path can split the frame stream into
+/// per-frame packets).
+#[allow(clippy::too_many_arguments)]
 fn encode_frames_inner(
     interleaved: &[i32],
     channels: u32,
@@ -611,6 +615,7 @@ fn encode_frames_inner(
     blocksize: u32,
     config: &Config,
     mut seektable: Option<&mut [metadata::SeekPoint]>,
+    mut frame_lengths: Option<&mut Vec<usize>>,
 ) -> (Vec<u8>, u32, u32) {
     let ch = channels as usize;
     assert!(ch > 0 && interleaved.len() % ch == 0, "ragged interleave");
@@ -833,6 +838,9 @@ fn encode_frames_inner(
         let fsize = frame.as_bytes().len() as u32;
         min_framesize = min_framesize.min(fsize);
         max_framesize = max_framesize.max(fsize);
+        if let Some(fl) = frame_lengths.as_deref_mut() {
+            fl.push(fsize as usize);
+        }
         out.extend_from_slice(frame.as_bytes());
 
         start += bs;
@@ -890,6 +898,7 @@ pub fn encode(
         blocksize,
         config,
         filled_seektable.as_deref_mut(),
+        None,
     );
 
     let md5 = if do_md5 {
@@ -928,4 +937,115 @@ pub fn encode(
     let mut out = bw.as_bytes().to_vec();
     out.extend_from_slice(&frames);
     out
+}
+
+/// Encode interleaved integer PCM into a complete **Ogg FLAC** stream, byte-identical
+/// to libFLAC+libogg. The native FLAC stream (STREAMINFO + `blocks` + frames) is
+/// mapped into Ogg packets and paged exactly as libFLAC's `ogg_encoder_aspect` drives
+/// libogg:
+/// - The first packet (BOS page) is `0x7F` + `"FLAC"` + mapping version `1.0` +
+///   a 2-byte header count (always 0 = "unknown") + `"fLaC"` + STREAMINFO, flushed.
+/// - Each remaining metadata block is its own flushed packet/page. **A SEEKTABLE is
+///   dropped** (libFLAC removes it for Ogg).
+/// - Each audio frame is its own packet, paged out (accumulated) with the last frame
+///   carrying EOS. Granule positions are cumulative sample counts.
+///
+/// `serial` is the Ogg logical-bitstream serial number. As with [`encode`], pass a
+/// [`metadata::MetadataBlock::VorbisComment`] with [`metadata::LIBFLAC_VENDOR_STRING`]
+/// first to match libFLAC's default output.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_ogg(
+    interleaved: &[i32],
+    channels: u32,
+    bits_per_sample: u32,
+    sample_rate: u32,
+    blocksize: u32,
+    config: &Config,
+    do_md5: bool,
+    blocks: &[metadata::MetadataBlock],
+    serial: i32,
+) -> Vec<u8> {
+    let ch = channels as usize;
+    assert!(ch > 0 && interleaved.len() % ch == 0, "ragged interleave");
+    let total_samples = (interleaved.len() / ch) as u64;
+
+    // Encode the audio frames, capturing each frame's byte length so the stream can
+    // be split into per-frame Ogg packets. (Ogg drops the seektable, so none here.)
+    let mut frame_lengths: Vec<usize> = Vec::new();
+    let (frames, min_framesize, max_framesize) = encode_frames_inner(
+        interleaved,
+        channels,
+        bits_per_sample,
+        sample_rate,
+        blocksize,
+        config,
+        None,
+        Some(&mut frame_lengths),
+    );
+
+    let md5 = if do_md5 {
+        crate::md5::audio_md5(interleaved, bits_per_sample.div_ceil(8) as usize)
+    } else {
+        [0u8; 16]
+    };
+    let si = metadata::StreamInfo {
+        min_blocksize: blocksize,
+        max_blocksize: blocksize,
+        min_framesize,
+        max_framesize,
+        sample_rate,
+        channels,
+        bits_per_sample,
+        total_samples,
+        md5,
+    };
+
+    // Metadata blocks to write after STREAMINFO, with the seektable removed.
+    let meta: Vec<&metadata::MetadataBlock> = blocks
+        .iter()
+        .filter(|b| !matches!(b, metadata::MetadataBlock::Seektable(_)))
+        .collect();
+
+    // The BOS packet: mapping header + native "fLaC" + STREAMINFO (is_last is false
+    // when metadata blocks follow, matching libFLAC's native ordering).
+    let mut si_bw = BitWriter::new();
+    metadata::write_streaminfo(&mut si_bw, &si, meta.is_empty());
+    let mut bos = Vec::with_capacity(13 + 38);
+    bos.push(0x7F);
+    bos.extend_from_slice(b"FLAC");
+    bos.push(1); // mapping version major
+    bos.push(0); // mapping version minor
+    bos.extend_from_slice(&[0, 0]); // header packet count: 0 = unknown
+    bos.extend_from_slice(b"fLaC");
+    bos.extend_from_slice(si_bw.as_bytes());
+
+    let mut og = ogg::OggStream::new(serial);
+    og.packetin(&bos, false, 0);
+    og.flush();
+
+    for (i, block) in meta.iter().enumerate() {
+        let is_last = i + 1 == meta.len();
+        let mut bw = BitWriter::new();
+        metadata::write_block(&mut bw, block, is_last);
+        og.packetin(bw.as_bytes(), false, 0);
+        og.flush();
+    }
+
+    let nframes = frame_lengths.len();
+    let mut byte_off = 0usize;
+    let mut sample_off = 0u64;
+    for (i, &flen) in frame_lengths.iter().enumerate() {
+        let fsamples = (blocksize as u64).min(total_samples - sample_off);
+        sample_off += fsamples;
+        let is_last = i + 1 == nframes;
+        og.packetin(
+            &frames[byte_off..byte_off + flen],
+            is_last,
+            sample_off as i64,
+        );
+        byte_off += flen;
+        og.pageout();
+    }
+
+    og.into_bytes()
 }

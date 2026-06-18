@@ -191,6 +191,87 @@ static FLAC__StreamEncoderTellStatus mem_tell(const FLAC__StreamEncoder *encoder
     return FLAC__STREAM_ENCODER_TELL_STATUS_OK;
 }
 
+/* Read-back callback for the Ogg encoder: at finish it re-reads the first page to
+ * rewrite STREAMINFO with the final framesizes / total samples / MD5. */
+static FLAC__StreamEncoderReadStatus mem_read(const FLAC__StreamEncoder *encoder,
+                                              FLAC__byte buffer[], size_t *bytes,
+                                              void *client_data) {
+    mem_sink *s = (mem_sink *)client_data;
+    size_t avail = s->len - s->pos;
+    size_t want = *bytes;
+    (void)encoder;
+    if (want > avail) {
+        want = avail;
+    }
+    if (want == 0) {
+        *bytes = 0;
+        return FLAC__STREAM_ENCODER_READ_STATUS_END_OF_STREAM;
+    }
+    memcpy(buffer, s->buf + s->pos, want);
+    s->pos += want;
+    *bytes = want;
+    return FLAC__STREAM_ENCODER_READ_STATUS_CONTINUE;
+}
+
+/* Encode a complete Ogg FLAC stream to memory at the given compression level.
+ * libFLAC wraps the native stream in Ogg via libogg (the vendored cref oracle is
+ * built with FLAC__HAS_OGG=1). A fixed serial number makes the output
+ * deterministic; the default VORBIS_COMMENT is auto-inserted (no user metadata). */
+int libflac_rs_cref_encode_ogg(const int32_t *interleaved, uint32_t nsamples,
+                               uint32_t channels, uint32_t bps,
+                               uint32_t sample_rate, uint32_t blocksize,
+                               int32_t compression_level, int32_t do_md5,
+                               int32_t serial_number, uint8_t *out,
+                               size_t *out_len) {
+    mem_sink sink;
+    FLAC__StreamEncoder *enc;
+    FLAC__StreamEncoderInitStatus init;
+    int rc = 0;
+
+    sink.buf = out;
+    sink.cap = *out_len;
+    sink.pos = 0;
+    sink.len = 0;
+    sink.overflow = 0;
+
+    enc = FLAC__stream_encoder_new();
+    if (!enc) {
+        return -1;
+    }
+    FLAC__stream_encoder_set_verify(enc, false);
+    FLAC__stream_encoder_set_compression_level(
+        enc, compression_level >= 0 ? (uint32_t)compression_level : 8);
+    FLAC__stream_encoder_set_channels(enc, channels);
+    FLAC__stream_encoder_set_bits_per_sample(enc, bps);
+    FLAC__stream_encoder_set_sample_rate(enc, sample_rate);
+    FLAC__stream_encoder_set_total_samples_estimate(enc, 0);
+    FLAC__stream_encoder_set_streamable_subset(enc, false);
+    FLAC__stream_encoder_set_blocksize(enc, blocksize);
+    FLAC__stream_encoder_set_do_md5(enc, do_md5 != 0);
+    FLAC__stream_encoder_set_ogg_serial_number(enc, serial_number);
+
+    init = FLAC__stream_encoder_init_ogg_stream(enc, mem_read, mem_write, mem_seek,
+                                                mem_tell, NULL, &sink);
+    if (init != FLAC__STREAM_ENCODER_INIT_STATUS_OK) {
+        FLAC__stream_encoder_delete(enc);
+        return -100 - (int)init;
+    }
+    if (!FLAC__stream_encoder_process_interleaved(enc, interleaved, nsamples)) {
+        rc = -200 - (int)FLAC__stream_encoder_get_state(enc);
+    } else if (!FLAC__stream_encoder_finish(enc)) {
+        rc = -300 - (int)FLAC__stream_encoder_get_state(enc);
+    }
+    FLAC__stream_encoder_delete(enc);
+    if (rc != 0) {
+        return rc;
+    }
+    if (sink.overflow) {
+        return -2;
+    }
+    *out_len = sink.len;
+    return 0;
+}
+
 /* Encode a complete FLAC stream (marker + metadata + frames) to memory at the
  * given compression level, optionally computing the audio MD5. */
 int libflac_rs_cref_encode_full(const int32_t *interleaved, uint32_t nsamples,

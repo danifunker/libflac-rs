@@ -71,9 +71,13 @@ Files in scope (scalar reference path only — see the SIMD note below):
 | `format.c` | (constants) | header/validation constants |
 | `memory.c`, `md5.c` | — | replaced by Rust / skipped (MD5 off) |
 
-**Out of scope:** every `*_intrin_*` / `*_asm_*` translation unit, Ogg, metadata
-objects, the decoder (except as linked by the oracle's verify path). License is
-BSD-3-Clause; retain the Xiph copyright (see LICENSE).
+**Out of scope:** every `*_intrin_*` / `*_asm_*` translation unit, and the
+`metadata_object.c` helpers (we fill metadata structs directly). The decoder, the
+full metadata blocks, and Ogg FLAC are all now **in** scope and done (see
+Milestones): the oracle additionally compiles libFLAC's Ogg layer (`ogg_*.c`) with
+`FLAC__HAS_OGG=1` plus vendored **libogg** (`cref/vendor/ogg`) for the Ogg-FLAC
+differential tests. License is BSD-3-Clause; retain the Xiph copyrights for both
+libFLAC and libogg (see LICENSE).
 
 ## The exact settings CHD uses
 
@@ -236,8 +240,16 @@ diffing at the first mismatching field to localize float drift.
   (`decode(encode(pcm)) == pcm`, all depths/levels, MD5 ok) and by **decoding real
   libFLAC output** (`decode_libflac_streams`). Phase 9 then added **SEEKTABLE-driven
   `seek()`** (`decode_seek`) and **variable-block-size** decoding (`read_utf8_u64`,
-  selected by the blocking-strategy bit). Remaining: a streaming/push API (Phase 11)
-  and Ogg (Phase 10).
+  selected by the blocking-strategy bit). Remaining: a streaming/push API (Phase 11).
+- **O1 — Ogg FLAC DONE (byte-exact).** `ogg.rs` ports libogg 1.3.5 paging
+  (`framing.c`) + the FLAC-in-Ogg mapping (`ogg_encoder_aspect.c`).
+  `encoder::encode_ogg` is **byte-identical to libFLAC+libogg** and
+  `decoder::decode_ogg` round-trips. Crux: libogg's CRC-32 (`0x04c11db7`,
+  unreflected), lacing, and the `flush_i` page heuristic (BOS = 1 packet; audio
+  pages at `>4096` bytes & `≥4` packets, else 255 segs, forced at EOS); the BOS
+  header-packet count is `0` (unknown) and the SEEKTABLE is dropped for Ogg. The
+  oracle is built `FLAC__HAS_OGG=1` with the `ogg_*.c` layer + vendored libogg
+  (`cref/vendor/ogg`); still zero **runtime** deps.
 
 ## Conventions
 

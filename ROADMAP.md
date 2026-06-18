@@ -9,10 +9,10 @@ reference to port, the data shapes, the bit-exactness traps, and how to verify.
 config** and has generalized to **all levels (0–8)**, **bit depths 8/12/16/20/24**,
 and **complete `.flac` files** at **every standard bit depth (8–32)** — and a
 **decoder** that losslessly round-trips the encoder and reads real libFLAC output
-(MD5-verified). Phases **0–9 are DONE** — full metadata (incl. SEEKTABLE + CUESHEET)
-and a complete decoder with `seek()` and variable-block-size support; remaining: Ogg
-(Phase 10) and the public API + publish (Phase 11, which also absorbs the streaming
-decode API).
+(MD5-verified). Phases **0–10 are DONE** — full metadata (incl. SEEKTABLE +
+CUESHEET), a complete decoder with `seek()` and variable-block-size support, and
+**byte-exact Ogg FLAC** (encode + decode) verified against libFLAC+libogg; remaining:
+the public API + publish (Phase 11, which also absorbs the streaming decode API).
 
 ```
 DONE   Phase 0  Bitwriter + CRC                      █████████
@@ -27,7 +27,7 @@ DONE   Phase 8  Metadata: APPLICATION + PICTURE +     ████████�
                  SEEKTABLE + CUESHEET (all byte-exact)
 DONE   Phase 9  The decoder: round-trips, reads real  █████████
                  libFLAC, seek() + variable blocksize
-TODO   Phase 10 Ogg FLAC (optional)                  ░░░░░░░░░
+DONE   Phase 10 Ogg FLAC (byte-exact vs libogg)       █████████
 TODO   Phase 11 Public API, docs, publish            ░░░░░░░░░
 ```
 
@@ -311,28 +311,42 @@ libFLAC's own decode, sample-for-sample, including MD5.
 
 ---
 
-# TODO — Phase 10: Ogg FLAC (optional)
+# DONE — Phase 10: Ogg FLAC (byte-exact vs libFLAC+libogg)
 
-**Goal:** FLAC-in-Ogg encapsulation (`.oga`/`.ogg`). Lower priority — most
-consumers (incl. CHD) use native FLAC.
+**Status: DONE — byte-identical to libFLAC+libogg.** `ogg.rs` is a faithful port of
+the libogg 1.3.5 paging (`framing.c`) plus the FLAC-in-Ogg mapping that libFLAC's
+`ogg_encoder_aspect.c` drives. `encoder::encode_ogg` produces an Ogg FLAC stream
+byte-for-byte identical to libFLAC built with `FLAC__HAS_OGG=1`+libogg, and
+`decoder::decode_ogg` reads pages back to PCM (round-trips + decodes real libFLAC
+Ogg). Still pure-Rust / zero-dependency — libogg is **not** a runtime dependency,
+only a dev-only oracle vendored under `cref/vendor/ogg`.
 
-**Reference:** the Ogg bitstream spec + the FLAC-in-Ogg mapping.
+**The byte-exact crux** was reproducing libogg's paging exactly: the CRC-32
+(polynomial `0x04c11db7`, **unreflected**, init/final 0); lacing (`bytes/255 + 1`
+segments, trailing `bytes % 255`); and `ogg_stream_flush_i`'s page-decision logic —
+the BOS page holds exactly the first packet, metadata packets are each flushed, and
+audio packets accumulate via `pageout` until a *nominal* page (`> 4096` body bytes
+**and** `≥ 4` complete packets) or 255 segments, with the final page forced at EOS.
 
-### Tasks
-1. **Ogg paging** — `OggS` pages: capture pattern, version, header type
-   (continued/bos/eos), **granule position** (= sample number of the last
-   completed packet), serial number, page sequence, **CRC-32** (Ogg polynomial),
-   segment table (lacing values). One logical bitstream.
-2. **FLAC mapping** — first packet (BOS): `0x7F` · `"FLAC"` · mapping version
-   (`1 0`) · header-packet count (u16 BE) · the native STREAMINFO block (with its
-   4-byte header). Subsequent header packets: the remaining native metadata
-   blocks, one per packet. Then audio: one FLAC frame per packet, granule =
-   running sample count.
-3. **Encoder/decoder wrappers** that wrap the native frame/metadata stream in
-   pages, and (decode) reassemble packets from pages.
+**Mapping details that mattered:**
+- BOS packet (51 bytes): `0x7F` · `"FLAC"` · `1` · `0` · header count **`0`**
+  (= "unknown"; libFLAC never back-patches it) · `"fLaC"` · STREAMINFO (with
+  `is_last = 0`, since the auto VORBIS_COMMENT follows).
+- libFLAC **drops any SEEKTABLE** for Ogg (`stream_encoder.c:773`).
+- Granule position = cumulative samples through the page's last completed packet
+  (0 for the BOS/metadata pages); the per-frame packet granule is the running
+  sample count *after* that frame.
+- STREAMINFO is back-patched at finish in C (seek + rewrite + page-CRC); we build
+  it correct in one pass, which yields the identical bytes.
 
-**Verify:** diff against libFLAC built with `FLAC__HAS_OGG=1` (a separate oracle
-build), or round-trip through `liboggflac`/`flac --ogg`.
+**Oracle:** `build.rs` now compiles the oracle with `FLAC__HAS_OGG=1`, the four
+libFLAC Ogg-layer TUs (`ogg_encoder_aspect.c`, `ogg_decoder_aspect.c`,
+`ogg_helper.c`, `ogg_mapping.c`), and vendored libogg (`framing.c`, `bitwise.c`).
+The Ogg paths are runtime-gated on `is_ogg`, so native output stays byte-identical
+(the pre-existing differential tests still pass). The shim's
+`libflac_rs_cref_encode_ogg` uses `FLAC__stream_encoder_init_ogg_stream` with a
+fixed serial number; `ogg_stream_matches_c` diffs full streams and
+`decode_ogg_libflac_streams` round-trips real libFLAC Ogg.
 
 ---
 
