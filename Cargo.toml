@@ -29,15 +29,18 @@ default = []
 # byte-for-byte. Requires a C compiler; glibc/gcc is the reference libm the
 # float-parity work targets. Not usable from the published crate (build.rs +
 # cref/ are excluded); run it from a repo checkout: `cargo test --features cref`.
-cref = []
+# Pulls in `cc` (the only build-dep) *only* when enabled — a default build, and
+# every consumer of the published crate, resolves zero dependencies of any kind.
+cref = ["dep:cc"]
 
 [lib]
 name = "libflac_rs"
 
 [build-dependencies]
-# Only used by build.rs under the `cref` feature (a repo checkout); the published
-# crate excludes build.rs, so consumers pull in nothing.
-cc = "1.2"
+# Only used by build.rs under the `cref` feature (a repo checkout). Optional + gated
+# on `cref` so it is absent from the dependency graph entirely for a default build
+# (and the published crate, which also excludes build.rs).
+cc = { version = "1.2", optional = true }
 
 [profile.dev]
 # The differential tests push the full corpus through both the Rust and C
