@@ -265,4 +265,4 @@ diffing at the first mismatching field to localize float drift.
   dependencies** (pure `std`, not even a build script) — keep it that way. The oracle
   (and its `cc` build-dep) is restored on demand from the `c-oracle` tag for
   byte-exact re-checks; see `ORACLE.md`.
-- Version scheme `0.<flac-digits>.<patch>` (1.4.3 → `0.143.x`); git tag `v0.143.0`.
+- Version scheme `0.<flac-digits>.<patch>` (1.4.3 → `0.143.x`); git tag `v0.143.1`.
