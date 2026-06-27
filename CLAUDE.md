@@ -28,37 +28,36 @@ This is bit-exactness-first work: a "working" codec that produces valid FLAC is
 ## Commands
 
 ```sh
-# Pure-Rust build/test (any platform); the published crate is pure Rust, zero deps.
+# Pure-Rust build/test (any platform); the whole repo is pure Rust, zero deps.
 cargo build
 cargo test
-
-# Differential vs the C oracle. The oracle is the real libFLAC 1.4.3 compiled from
-# the sibling MAME tree under the `cref` feature. RUN THIS IN WSL (glibc): the C
-# oracle and Rust's f32/f64 transcendentals then resolve to the same libm.
-#   wsl bash -lc 'cd /mnt/c/.../libflac-rs && \
-#     CARGO_TARGET_DIR=$HOME/.cache/libflac-rs-target cargo test --features cref'
-cargo test --features cref
-
 cargo fmt
-cargo clippy --all-targets --features cref -- -D warnings
+cargo clippy --all-targets -- -D warnings
+cargo doc --no-deps        # with RUSTDOCFLAGS="-D warnings", as CI does
 ```
 
-`FLAC_C_DIR` overrides the libFLAC source location (default
-`../mame/3rdparty/flac`). Set `CARGO_TARGET_DIR` to a native Linux path when
-building under WSL on a `/mnt/c` checkout — it keeps builds fast and avoids 9p
-quirks in `target/`.
+**The C differential oracle is no longer in the tree.** Byte-exactness against the C
+reference is re-checked on demand by restoring the oracle — see **`ORACLE.md`** for
+the full process (TL;DR: `git checkout c-oracle -- cref build.rs`, re-add the `cref`
+feature + `cc` build-dep, then run `cargo test --features cref` in WSL/glibc so the C
+and Rust transcendentals resolve to the same libm). When porting/debugging a byte
+divergence, restore the oracle and **read the C** — do not reconstruct logic from
+memory. Set `CARGO_TARGET_DIR` to a native Linux path under WSL on a `/mnt/c`
+checkout to keep builds fast and avoid 9p quirks in `target/`.
 
-## Source of truth: the vendored C libFLAC
+## Source of truth: the C libFLAC oracle (restored on demand)
 
-The differential oracle is **libFLAC 1.4.3** (Xiph.Org, BSD-3-Clause), in the
-sibling checkout at `../mame/3rdparty/flac/`. `build.rs` compiles the scalar
+The differential oracle is **libFLAC 1.4.3** (Xiph.Org, BSD-3-Clause). It is no
+longer vendored in the tree — restore it with `git checkout c-oracle -- cref
+build.rs` (see **`ORACLE.md`**). When restored, `build.rs` compiles the scalar
 reference path under the `cref` feature; `cref/shim.c` drives the encoder and
 captures only the audio frames (write-callback `samples > 0`), discarding the
 stream marker + metadata exactly as CHD does. When porting or debugging a
 divergence, **read the C** — do not reconstruct logic from memory. Module
 doc-comments cite specific `*.c:NNN` lines; keep those citations accurate.
 
-Files in scope (scalar reference path only — see the SIMD note below):
+The port ↔ C-file correspondence (scalar reference path only — see the SIMD note
+below):
 
 | C file | Rust module | Role |
 | --- | --- | --- |
@@ -146,7 +145,8 @@ libFLAC two ways (scalar `-DFLAC__NO_ASM` vs MAME's full define set + the
 
 ## Differential testing
 
-`build.rs` + `cref/shim.c` compile libFLAC under the `cref` feature and expose
+The rig (removed from the tree; restore per **`ORACLE.md`**): `build.rs` +
+`cref/shim.c` compile libFLAC under the `cref` feature and expose
 `libflac_rs_cref_encode(interleaved, nsamples, channels, bps, sample_rate,
 blocksize, max_lpc_order, do_mid_side, out, out_len)`. `max_lpc_order`/`do_mid_side`
 < 0 keep the level-8 preset; ≥ 0 override them for **staged testing**
@@ -261,8 +261,8 @@ diffing at the first mismatching field to localize float drift.
 - Faithful transcription over "improved" Rust when bit-exactness is at stake;
   idiomatic refactors are fine only for plumbing that cannot affect output bytes.
 - Keep `*.c:NNN` citations in module docs accurate when you touch the code.
-- Library is `#![forbid(unsafe_code)]`, edition 2024, MSRV 1.85, **zero runtime
-  dependencies** (pure `std`) — keep it that way. The only dependency is `cc`, a
-  build-dependency used solely by the `cref` oracle (excluded from the published
-  crate along with `build.rs` and `cref/`).
+- Library is `#![forbid(unsafe_code)]`, edition 2024, MSRV 1.85, **zero
+  dependencies** (pure `std`, not even a build script) — keep it that way. The oracle
+  (and its `cc` build-dep) is restored on demand from the `c-oracle` tag for
+  byte-exact re-checks; see `ORACLE.md`.
 - Version scheme `0.<flac-digits>.<patch>` (1.4.3 → `0.143.x`); git tag `v0.143.0`.

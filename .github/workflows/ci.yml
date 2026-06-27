@@ -9,9 +9,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Portability tracker: the pure-Rust library builds and its tests pass on every
-  # platform. No C toolchain is involved (build.rs is a no-op without `cref`), so
-  # this guards against platform-specific regressions as the port grows.
+  # The pure-Rust library builds and its tests pass on every platform. There is no
+  # C toolchain, build script, or dependency involved, so this also guards against
+  # platform-specific regressions. The lossless round-trip tests (encode -> decode ->
+  # PCM, MD5-verified, all depths/levels) live here; byte-exactness vs the C
+  # reference is re-checked on demand via the documented oracle process (ORACLE.md).
   test:
     strategy:
       fail-fast: false
@@ -24,20 +26,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
 
-  # Bit-exactness gate: diff the Rust output against the vendored libFLAC, compiled
-  # by cc. Pinned to Linux/glibc on purpose — glibc's libm is the float-parity
-  # target (it is what MAME/chdman use), so the byte-for-byte comparison is only
-  # meaningful here. Release mode keeps the differential corpus quick.
-  # `--locked`: the committed Cargo.lock pins the build toolchain (cc); CI fails on
-  # drift.
-  differential:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --release --locked --features cref
-
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -47,7 +35,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets --features cref -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo doc --locked --no-deps
         env:
           RUSTDOCFLAGS: -D warnings

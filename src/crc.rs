@@ -5,9 +5,9 @@
 //!
 //! `crc.c` ships precomputed tables (an 8×256 CRC-16 table for an 8-byte-at-a-time
 //! loop); we generate the 256-entry tables from the polynomials at compile time
-//! instead — byte-at-a-time with `table[0]` yields bit-identical results, and the
-//! `cref` tests assert byte parity against the C `FLAC__crc8`/`FLAC__crc16`
-//! (`crc.c:366`, `crc.c:376`).
+//! instead — byte-at-a-time with `table[0]` yields bit-identical results, asserted
+//! byte-for-byte against the C `FLAC__crc8`/`FLAC__crc16` (`crc.c:366`, `crc.c:376`)
+//! by the differential harness (see `ORACLE.md`).
 
 /// CRC-8 table: `table[i]` = CRC-8 of the single byte `i` (`crc.c:41`).
 const fn crc8_table() -> [u8; 256] {

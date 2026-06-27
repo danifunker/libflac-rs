@@ -9,8 +9,10 @@ byte-identical to libFLAC — which is precisely why this exists.)
 
 ## Status — complete and byte-exact
 
-Every byte is continuously verified **against the real libFLAC** (and libogg for
-Ogg), compiled from source as a dev-only oracle (the `cref` feature):
+Every byte was verified **against the real libFLAC** (and libogg for Ogg), compiled
+from source as a differential oracle. That oracle is no longer vendored — the repo is
+100% pure Rust — but the process to re-establish and re-run it is documented in
+[`ORACLE.md`](ORACLE.md):
 
 - ✅ **Encoder**, byte-identical to libFLAC: compression levels **0–8**, bit depths
   **8/12/16/20/24/32**, mono / stereo (mid-side) / multichannel, the audio MD5, and
@@ -44,19 +46,16 @@ MD5 off), construct with `EncoderConfig::chd(block_size)` and call `encode_frame
 
 ## Pure Rust, zero dependencies
 
-The library is `#![forbid(unsafe_code)]` with **no runtime dependencies**. The C
-libFLAC (and libogg) are compiled **only** as a test oracle under the `cref` feature
-and are excluded from the published crate, so consumers get a dependency-free
-library.
+The crate is `#![forbid(unsafe_code)]`, edition 2024, with **no dependencies at all**
+— not even a build script. There is no C in the repository.
 
 ```sh
-cargo test                  # pure-Rust unit tests (any platform)
-cargo test --features cref  # differential vs the compiled C oracle (Linux/glibc)
+cargo test   # pure-Rust unit + lossless round-trip tests (any platform)
 ```
 
-Bit-exactness is verified on **glibc**: its libm (`cosf`, `lround`) is the parity
-target — it is what MAME/chdman use — so the differential tests run there, while
-the pure-Rust build is checked on Linux, Windows, and macOS.
+Byte-exactness against the C reference is re-checked **on demand** by restoring the
+differential oracle (vendored libFLAC + libogg, built under glibc/gcc — the libm
+parity target MAME/chdman use). See [`ORACLE.md`](ORACLE.md) for the exact process.
 
 ## License
 

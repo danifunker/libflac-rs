@@ -790,8 +790,8 @@ mod tests {
 
     /// Ogg FLAC round-trip: `encode_ogg` → `decode_ogg` reproduces the PCM exactly
     /// (with the embedded MD5 verifying), across all depths incl. 32-bit. The
-    /// byte-exactness of `encode_ogg` vs libFLAC is covered by the `cref` tests; this
-    /// exercises the pure-Rust page demux + FLAC demap with no oracle.
+    /// byte-exactness of `encode_ogg` vs libFLAC+libogg is covered by the differential
+    /// harness (see `ORACLE.md`); this exercises the pure-Rust page demux + FLAC demap.
     #[test]
     fn ogg_round_trip() {
         for &bps in &[8u32, 16, 20, 24, 32] {

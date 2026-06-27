@@ -16,33 +16,16 @@ documentation = "https://docs.rs/libflac-rs"
 keywords = ["flac", "audio", "lossless", "chd", "encoder"]
 categories = ["multimedia::audio", "multimedia::encoding"]
 readme = "README.md"
-# The published crate is a pure-Rust, dependency-free library plus its proof
-# (src, tests, README/ROADMAP/LICENSE). Drop the AI dev guide, the CI config, and
-# the entire `cref/` differential rig — the vendored C oracle, the FFI shim, and
-# build.rs — none of which a consumer needs.
-exclude = ["/.github", "/CLAUDE.md", "/cref", "/build.rs"]
-
-[features]
-default = []
-# Dev/test only: compile the real libFLAC 1.4.3 C sources via build.rs and expose
-# them over FFI so tests can diff the Rust frame output against the C encoder
-# byte-for-byte. Requires a C compiler; glibc/gcc is the reference libm the
-# float-parity work targets. Not usable from the published crate (build.rs +
-# cref/ are excluded); run it from a repo checkout: `cargo test --features cref`.
-# Pulls in `cc` (the only build-dep) *only* when enabled — a default build, and
-# every consumer of the published crate, resolves zero dependencies of any kind.
-cref = ["dep:cc"]
+# The published crate is a pure-Rust, dependency-free library plus its docs (src,
+# README/ROADMAP/ORACLE/LICENSE). Drop only the AI dev guide and the CI config.
+# There is no C, no build script, and no build/runtime dependency to exclude — the
+# byte-exact differential oracle is no longer vendored (see ORACLE.md).
+exclude = ["/.github", "/CLAUDE.md"]
 
 [lib]
 name = "libflac_rs"
 
-[build-dependencies]
-# Only used by build.rs under the `cref` feature (a repo checkout). Optional + gated
-# on `cref` so it is absent from the dependency graph entirely for a default build
-# (and the published crate, which also excludes build.rs).
-cc = { version = "1.2", optional = true }
-
 [profile.dev]
-# The differential tests push the full corpus through both the Rust and C
-# encoders; opt-level 1 keeps debug test runs brisk.
+# The round-trip tests encode and decode the full corpus across every depth/level;
+# opt-level 1 keeps debug test runs brisk.
 opt-level = 1

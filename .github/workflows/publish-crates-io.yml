@@ -1,9 +1,9 @@
 name: Publish to crates.io
 
-# This crate publishes as pure Rust: build.rs and the entire cref/ differential
-# rig (including the vendored libFLAC) are excluded from the package (see
-# [package.exclude] in Cargo.toml), so the normal `cargo publish` verification
-# build runs and pulls in nothing.
+# This crate publishes as pure Rust: the whole repository is pure Rust (no build
+# script, no C, no dependencies — the differential oracle is restored on demand from
+# the `c-oracle` tag, see ORACLE.md), so the normal `cargo publish` verification build
+# pulls in nothing. The slim-tarball check below stays as a defensive guard.
 #
 # Flow: tag the release (vX.Y.Z, matching Cargo.toml), then dispatch this workflow
 # with that tag (dry_run first, then for real). Requires the CARGO_REGISTRY_TOKEN

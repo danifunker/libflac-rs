@@ -16,10 +16,6 @@ pub use autocorr::compute_autocorrelation;
 pub use levinson::{LpCoefficients, compute_best_order, compute_lp_coefficients, expected_bits};
 pub use quantize::quantize_coefficients;
 pub use residual::{compute_residual, compute_residual_limit, max_residual_bps};
-// `Quantized` is named only by the differential tests; the encoder uses the
-// returned value's fields without naming the type.
-#[cfg(feature = "cref")]
-pub use quantize::Quantized;
 
 /// Maximum LPC order (`FLAC__MAX_LPC_ORDER`); the Levinson coefficient rows and
 /// the predictor history are sized to this.
