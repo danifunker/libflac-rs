@@ -65,10 +65,11 @@ mod subframe;
 mod window;
 
 pub use decoder::{
-    DecodedFrames, DecodedStream, SeekResult, decode, decode_frames, decode_ogg, decode_seek,
+    DecodedFrames, DecodedStream, DecodedVorbisComment, SeekResult, decode, decode_frames,
+    decode_ogg, decode_seek,
 };
 pub use encoder::{Encoder, EncoderConfig};
 pub use metadata::{
     CueSheetIndex, CueSheetTrack, LIBFLAC_VENDOR_STRING, MetadataBlock, SeekPoint,
-    spaced_seek_points,
+    spaced_seek_points, vorbis_comment_entry,
 };

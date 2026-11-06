@@ -68,6 +68,41 @@ pub struct DecodedStream {
     /// The seek points from the SEEKTABLE block, if any (empty otherwise). Trailing
     /// placeholder points (sample number `0xFFFF…`) are retained as stored.
     pub seek_points: Vec<SeekPoint>,
+    /// The VORBIS_COMMENT block, if any.
+    pub vorbis_comment: Option<DecodedVorbisComment>,
+}
+
+/// A decoded VORBIS_COMMENT block: the vendor string and the user comments
+/// (`NAME=value` entries) in stored order. Non-UTF-8 bytes are replaced with
+/// U+FFFD, since other encoders do not always validate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedVorbisComment {
+    pub vendor: String,
+    pub comments: Vec<String>,
+}
+
+/// Parse a VORBIS_COMMENT block body: little-endian lengths, vendor string, comment
+/// count, then length-prefixed comments. `None` if a length runs past the block.
+fn parse_vorbis_comment(body: &[u8]) -> Option<DecodedVorbisComment> {
+    fn take<'a>(rest: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+        let (head, tail) = rest.split_at_checked(n)?;
+        *rest = tail;
+        Some(head)
+    }
+    fn u32_le(rest: &mut &[u8]) -> Option<u32> {
+        Some(u32::from_le_bytes(take(rest, 4)?.try_into().ok()?))
+    }
+    fn string(rest: &mut &[u8]) -> Option<String> {
+        let len = u32_le(rest)? as usize;
+        Some(String::from_utf8_lossy(take(rest, len)?).into_owned())
+    }
+    let mut rest = body;
+    let vendor = string(&mut rest)?;
+    let count = u32_le(&mut rest)?;
+    let comments = (0..count)
+        .map(|_| string(&mut rest))
+        .collect::<Option<Vec<_>>>()?;
+    Some(DecodedVorbisComment { vendor, comments })
 }
 
 /// Decode a complete FLAC stream: the `fLaC` marker, the metadata blocks (only
@@ -76,7 +111,7 @@ pub struct DecodedStream {
 /// input or any CRC mismatch.
 pub fn decode(data: &[u8]) -> Option<DecodedStream> {
     let mut br = BitReader::new(data);
-    let (info, seek_points) = parse_header(&mut br)?;
+    let (info, seek_points, vorbis_comment) = parse_header(&mut br)?;
 
     let mut interleaved = Vec::new();
     while br.byte_pos() < data.len() {
@@ -107,17 +142,21 @@ pub fn decode(data: &[u8]) -> Option<DecodedStream> {
         md5: info.md5,
         md5_ok,
         seek_points,
+        vorbis_comment,
     })
 }
 
-/// Parse the `fLaC` marker and the metadata blocks (interpreting STREAMINFO and
-/// SEEKTABLE, skipping the rest), leaving `br` positioned at the first audio frame.
-fn parse_header(br: &mut BitReader) -> Option<(StreamInfo, Vec<SeekPoint>)> {
+/// Parse the `fLaC` marker and the metadata blocks (interpreting STREAMINFO,
+/// SEEKTABLE and VORBIS_COMMENT, skipping the rest), leaving `br` positioned at the first audio frame.
+fn parse_header(
+    br: &mut BitReader,
+) -> Option<(StreamInfo, Vec<SeekPoint>, Option<DecodedVorbisComment>)> {
     if br.read_raw_u32(32)? != 0x664c_6143 {
         return None; // "fLaC"
     }
     let mut info: Option<StreamInfo> = None;
     let mut seek_points: Vec<SeekPoint> = Vec::new();
+    let mut vorbis_comment = None;
     loop {
         let is_last = br.read_raw_u32(1)? == 1;
         let block_type = br.read_raw_u32(7)?;
@@ -159,6 +198,11 @@ fn parse_header(br: &mut BitReader) -> Option<(StreamInfo, Vec<SeekPoint>)> {
             }
             // Tolerate a length not divisible by 18 (non-conforming writers).
             br.skip_bytes(length - n * 18)?;
+        } else if block_type == 4 {
+            // VORBIS_COMMENT
+            let start = br.byte_pos();
+            br.skip_bytes(length)?;
+            vorbis_comment = parse_vorbis_comment(br.bytes_since(start));
         } else {
             br.skip_bytes(length)?;
         }
@@ -166,7 +210,7 @@ fn parse_header(br: &mut BitReader) -> Option<(StreamInfo, Vec<SeekPoint>)> {
             break;
         }
     }
-    Some((info?, seek_points))
+    Some((info?, seek_points, vorbis_comment))
 }
 
 /// The result of a [`decode_seek`]: PCM from `first_sample` to the end of the
@@ -205,7 +249,7 @@ fn seek_start(seek_points: &[SeekPoint], target: u64) -> (u64, u64) {
 /// still works by decoding from the first frame.
 pub fn decode_seek(data: &[u8], target_sample: u64) -> Option<SeekResult> {
     let mut br = BitReader::new(data);
-    let (info, seek_points) = parse_header(&mut br)?;
+    let (info, seek_points, _) = parse_header(&mut br)?;
     if info.total_samples != 0 && target_sample >= info.total_samples {
         return None;
     }
@@ -251,7 +295,7 @@ pub fn decode_seek(data: &[u8], target_sample: u64) -> Option<SeekResult> {
 /// STREAMINFO), concatenates the audio-frame packets, and decodes them, verifying the
 /// audio MD5 against STREAMINFO. `None` on malformed Ogg (a bad page CRC or missing
 /// mapping) or any frame CRC mismatch. (Ogg FLAC carries no seektable, so
-/// `seek_points` is empty.)
+/// `seek_points` is empty; the VORBIS_COMMENT packet is parsed.)
 pub fn decode_ogg(data: &[u8]) -> Option<DecodedStream> {
     let packets = crate::ogg::read_packets(data)?;
     let bos = packets.first()?;
@@ -280,6 +324,15 @@ pub fn decode_ogg(data: &[u8]) -> Option<DecodedStream> {
 
     // Audio frames are the packets from the first one with a 0x3FFE sync (high byte
     // 0xFF); the metadata packets (VORBIS_COMMENT, etc.) precede them.
+    let first_frame = packets[1..]
+        .iter()
+        .position(|p| p.first() == Some(&0xFF))
+        .map_or(packets.len(), |i| 1 + i);
+    // each metadata packet is a block header (type in the low 7 bits) + body
+    let vorbis_comment = packets[1..first_frame]
+        .iter()
+        .find(|p| p.first().is_some_and(|h| h & 0x7F == 4))
+        .and_then(|p| parse_vorbis_comment(p.get(4..)?));
     let mut frame_bytes = Vec::new();
     if let Some(idx) = packets[1..].iter().position(|p| p.first() == Some(&0xFF)) {
         for p in &packets[1 + idx..] {
@@ -304,6 +357,7 @@ pub fn decode_ogg(data: &[u8]) -> Option<DecodedStream> {
         md5,
         md5_ok,
         seek_points: Vec::new(),
+        vorbis_comment,
     })
 }
 
@@ -645,6 +699,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn vorbis_comments_round_trip() {
+        use crate::metadata::{LIBFLAC_VENDOR_STRING, MetadataBlock, vorbis_comment_entry};
+        let pcm = gen_pcm(3, 5000, 16, 1);
+        let entries = [
+            vorbis_comment_entry("TITLE", "2026-11-05 22:14:03").unwrap(),
+            vorbis_comment_entry("COMMENT", "Fledermäuse, ünïcödé").unwrap(),
+            vorbis_comment_entry("EMPTY", "").unwrap(),
+        ];
+        let comments: Vec<&str> = entries.iter().map(String::as_str).collect();
+        let blocks = [MetadataBlock::VorbisCommentEntries {
+            vendor: LIBFLAC_VENDOR_STRING,
+            comments: &comments,
+        }];
+        let expected = Some(super::DecodedVorbisComment {
+            vendor: LIBFLAC_VENDOR_STRING.to_string(),
+            comments: entries.to_vec(),
+        });
+
+        // 384 kHz mono: the bat-recording case this was added for
+        let stream = encode(&pcm, 1, 16, 384_000, 4096, &preset(5), true, &blocks);
+        let dec = decode(&stream).expect("decode");
+        assert_eq!(dec.interleaved, pcm);
+        assert_eq!(dec.sample_rate, 384_000);
+        assert_eq!(dec.vorbis_comment, expected);
+
+        let ogg = encode_ogg(&pcm, 1, 16, 384_000, 4096, &preset(5), true, &blocks, 7);
+        let dec = decode_ogg(&ogg).expect("decode ogg");
+        assert_eq!(dec.interleaved, pcm);
+        assert_eq!(dec.vorbis_comment, expected);
+
+        // the vendor-only block still decodes, with no comments
+        let stream = encode(
+            &pcm,
+            1,
+            16,
+            44_100,
+            4096,
+            &preset(5),
+            true,
+            &[MetadataBlock::VorbisComment(LIBFLAC_VENDOR_STRING)],
+        );
+        assert_eq!(
+            decode(&stream).unwrap().vorbis_comment.unwrap().comments,
+            Vec::<String>::new()
+        );
     }
 
     #[test]
