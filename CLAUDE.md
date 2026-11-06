@@ -224,6 +224,12 @@ diffing at the first mismatching field to localize float drift.
   Phase 8 finished the remaining metadata blocks — APPLICATION, PICTURE, SEEKTABLE,
   and CUESHEET — all byte-exact vs libFLAC; SEEKTABLE is *generated* during
   encoding (`fill_seekpoints` + `metadata::seektable_sort`).
+  VORBIS_COMMENT user comments (`MetadataBlock::VorbisCommentEntries`,
+  `stream_encoder_framing.c:145-152`) and `vorbis_comment_entry` (libFLAC's
+  `entry_from_name_value_pair` with `format.c`'s name/value checks) were added in the
+  trackIT-Systems fork; tagged streams at 192/384/500 kHz, levels 0/5/8, are
+  byte-identical to libFLAC 1.5.0 apart from the vendor string. The decoder returns
+  the block as `DecodedStream::vorbis_comment` (native and Ogg).
 - **G3 — DONE (all bit depths 8/12/16/20/24/32).** RICE2 (5-bit params, escape 31)
   is selected per partition when any rice parameter reaches 15
   (`RicePartition::is_rice2`), driven by the `bps>16 ? 31 : 15` rice-parameter

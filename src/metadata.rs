@@ -83,6 +83,14 @@ pub struct CueSheetTrack<'a> {
 pub enum MetadataBlock<'a> {
     /// A VORBIS_COMMENT with the given vendor string and no user comments.
     VorbisComment(&'a str),
+    /// A VORBIS_COMMENT with the given vendor string and user comments, each a
+    /// complete `NAME=value` entry written verbatim and in order
+    /// (`stream_encoder_framing.c:145-152`). Build entries with
+    /// [`vorbis_comment_entry`], which validates them as libFLAC does.
+    VorbisCommentEntries {
+        vendor: &'a str,
+        comments: &'a [&'a str],
+    },
     /// A PADDING block of N zero bytes.
     Padding(u32),
     /// An APPLICATION block: a 4-byte registered application id + opaque data.
@@ -118,7 +126,10 @@ pub enum MetadataBlock<'a> {
 /// Write one [`MetadataBlock`] with its `is_last` flag.
 pub fn write_block(bw: &mut BitWriter, block: &MetadataBlock, is_last: bool) {
     match block {
-        MetadataBlock::VorbisComment(vendor) => write_vorbis_comment(bw, vendor, is_last),
+        MetadataBlock::VorbisComment(vendor) => write_vorbis_comment(bw, vendor, &[], is_last),
+        MetadataBlock::VorbisCommentEntries { vendor, comments } => {
+            write_vorbis_comment(bw, vendor, comments, is_last)
+        }
         MetadataBlock::Padding(len) => write_padding(bw, *len, is_last),
         MetadataBlock::Application { id, data } => write_application(bw, id, data, is_last),
         MetadataBlock::Seektable(points) => write_seektable(bw, points, is_last),
@@ -318,17 +329,47 @@ pub fn write_streaminfo(bw: &mut BitWriter, si: &StreamInfo, is_last: bool) {
     bw.write_byte_block(&si.md5);
 }
 
-/// Write a VORBIS_COMMENT block with the given vendor string and no comments
-/// (the empty block libFLAC auto-writes; `add_metadata_block`,
-/// `stream_encoder_framing.c:132`). The vendor length and comment count are
-/// little-endian per the Vorbis comment spec.
-pub fn write_vorbis_comment(bw: &mut BitWriter, vendor: &str, is_last: bool) {
+/// Write a VORBIS_COMMENT block: the vendor string, then the user comments
+/// (`stream_encoder_framing.c:132-152`). With no comments this is the empty block
+/// libFLAC auto-writes (`add_metadata_block`). The vendor length, comment count and
+/// comment lengths are little-endian per the Vorbis comment spec.
+pub fn write_vorbis_comment(bw: &mut BitWriter, vendor: &str, comments: &[&str], is_last: bool) {
     let vendor = vendor.as_bytes();
-    let length = 4 + vendor.len() as u32 + 4; // vendor-length + vendor + num-comments
+    // vendor-length + vendor + num-comments + (length + entry) per comment
+    let length =
+        4 + vendor.len() as u32 + 4 + comments.iter().map(|c| 4 + c.len() as u32).sum::<u32>();
     write_block_header(bw, is_last, METADATA_TYPE_VORBIS_COMMENT, length);
     bw.write_raw_u32_little_endian(vendor.len() as u32);
     bw.write_byte_block(vendor);
-    bw.write_raw_u32_little_endian(0); // num_comments
+    bw.write_raw_u32_little_endian(comments.len() as u32);
+    for comment in comments {
+        bw.write_raw_u32_little_endian(comment.len() as u32);
+        bw.write_byte_block(comment.as_bytes());
+    }
+}
+
+/// A Vorbis comment entry `NAME=value`, or `None` if libFLAC would reject it — the
+/// equivalent of `FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair`.
+///
+/// The name must be printable ASCII `0x20..=0x7D` without `=`
+/// (`FLAC__format_vorbiscomment_entry_name_is_legal`, `format.c:363`). The value
+/// must be legal UTF-8 for `FLAC__format_vorbiscomment_entry_value_is_legal`
+/// (`format.c:372`); a Rust `str` always is, except that libFLAC also rejects
+/// U+FFFE and U+FFFF (`utf8len_`, `format.c:339`). A NUL in the value is rejected
+/// too, since the C API would end the value there. The name is kept as given (field
+/// names compare case-insensitively; by convention they are upper case).
+///
+/// ```
+/// use libflac_rs::vorbis_comment_entry;
+/// assert_eq!(vorbis_comment_entry("TITLE", "Night 1").as_deref(), Some("TITLE=Night 1"));
+/// assert_eq!(vorbis_comment_entry("A=B", "x"), None);
+/// ```
+pub fn vorbis_comment_entry(name: &str, value: &str) -> Option<String> {
+    let name_ok = name
+        .bytes()
+        .all(|c| (0x20..=0x7D).contains(&c) && c != b'=');
+    let value_ok = !value.contains(['\0', '\u{FFFE}', '\u{FFFF}']);
+    (name_ok && value_ok).then(|| format!("{name}={value}"))
 }
 
 /// Write a PADDING block of `length` zero bytes (`add_metadata_block`,
@@ -341,6 +382,46 @@ pub fn write_padding(bw: &mut BitWriter, length: u32, is_last: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vorbis_comment_layout() {
+        let mut bw = BitWriter::new();
+        write_vorbis_comment(&mut bw, "v", &["A=1", "BC=xy"], true);
+        let bytes = bw.as_bytes();
+        #[rustfmt::skip]
+        let expected = [
+            0x84, 0, 0, 25,                 // last, type 4, length 4+1+4+(4+3)+(4+5)
+            1, 0, 0, 0, b'v',               // vendor
+            2, 0, 0, 0,                     // comment count
+            3, 0, 0, 0, b'A', b'=', b'1',
+            5, 0, 0, 0, b'B', b'C', b'=', b'x', b'y',
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn vorbis_comment_entries_are_validated_like_libflac() {
+        assert_eq!(
+            vorbis_comment_entry("TITLE", "x").as_deref(),
+            Some("TITLE=x")
+        );
+        assert_eq!(
+            vorbis_comment_entry("title", "x").as_deref(),
+            Some("title=x")
+        );
+        assert_eq!(vorbis_comment_entry(" }", "").as_deref(), Some(" }="));
+        assert_eq!(vorbis_comment_entry("A=B", "x"), None); // '='
+        assert_eq!(vorbis_comment_entry("A~", "x"), None); // 0x7E
+        assert_eq!(vorbis_comment_entry("A\tB", "x"), None); // control character
+        assert_eq!(vorbis_comment_entry("NÄME", "x"), None); // non-ASCII
+        assert_eq!(vorbis_comment_entry("A", "a\u{FFFE}"), None);
+        assert_eq!(vorbis_comment_entry("A", "a\u{FFFF}"), None);
+        assert_eq!(vorbis_comment_entry("A", "a\0b"), None);
+        assert_eq!(
+            vorbis_comment_entry("A", "a=b ü 🦇").as_deref(),
+            Some("A=a=b ü 🦇")
+        );
+    }
 
     fn pt(sample_number: u64, stream_offset: u64, frame_samples: u32) -> SeekPoint {
         SeekPoint {

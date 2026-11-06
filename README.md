@@ -41,6 +41,23 @@ assert_eq!(decoded.interleaved, pcm);
 assert!(decoded.md5_ok);
 ```
 
+To tag a file, add a VORBIS_COMMENT block with user comments; entries are checked
+the way libFLAC checks them:
+
+```rust
+use libflac_rs::{Encoder, EncoderConfig, LIBFLAC_VENDOR_STRING, MetadataBlock, vorbis_comment_entry};
+
+let enc = Encoder::new(EncoderConfig::new(1, 16, 384_000).with_compression_level(5));
+let entries = [vorbis_comment_entry("TITLE", "Night 1").unwrap()];
+let comments: Vec<&str> = entries.iter().map(String::as_str).collect();
+let flac = enc.encode_with_metadata(
+    &[0i32; 4096],
+    &[MetadataBlock::VorbisCommentEntries { vendor: LIBFLAC_VENDOR_STRING, comments: &comments }],
+);
+let decoded = libflac_rs::decode(&flac).unwrap();
+assert_eq!(decoded.vorbis_comment.unwrap().comments, ["TITLE=Night 1"]);
+```
+
 For the exact configuration MAME's CHD codec uses (level 8, 2ch/16-bit/44.1 kHz,
 MD5 off), construct with `EncoderConfig::chd(block_size)` and call `encode_frames`.
 
